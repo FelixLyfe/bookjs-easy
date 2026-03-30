@@ -1,6 +1,6 @@
 /*!
  * BookJS-Easy - WEB Print Auto Pagination / Preview / Make PDF
- * Version: 1.0.0
+ * Version: 2.0.0
  * Author: Felix Lyu
  * License: MIT
  */
@@ -297,10 +297,14 @@
                 // 检查内容是否超过单页最大高度
                 const maxPageContentHeight = this.pageHeight - this.padding.top - this.padding.bottom;
                 if (height > maxPageContentHeight) {
-                    console.warn('Content height exceeds single page height, forcing add to current page');
-                    page.content.appendChild(element);
-                    page.currentHeight += height;
-                    return page;
+                    console.warn('Content height exceeds single page height, adding from page top as fallback');
+                    if (page.currentHeight > 0) {
+                        this.createNewPage();
+                    }
+                    const targetPage = this.getCurrentPage();
+                    targetPage.content.appendChild(element);
+                    targetPage.currentHeight += height;
+                    return targetPage;
                 }
 
                 this.createNewPage();
@@ -502,6 +506,7 @@
             this.config = config;
             // 复用离屏测量容器，减少重复DOM读写与强制布局
             this._measureBox = null;
+            this.fitTolerance = 2;
 
             // 调试日志门控（与 BookJS.log 行为保持一致）
             this.log = (...args) => {
@@ -549,9 +554,9 @@
                         const tempTbl = tempWrapper.querySelector('table') || tempWrapper;
                         const tempBody = tempTbl.querySelector('tbody');
                         if (tempBody && tempBody.children.length > 0) {
-                            const firstRow = tempBody.children[0].cloneNode(true);
+                            const previewRows = Array.from(tempBody.children).slice(0, 2).map(row => row.cloneNode(true));
                             tempBody.innerHTML = '';
-                            tempBody.appendChild(firstRow);
+                            previewRows.forEach(row => tempBody.appendChild(row));
                             nextHeight = this.getElementHeight(tempWrapper);
                         } else {
                             nextHeight = 50;
@@ -603,9 +608,20 @@
             }
         }
 
+        canFitHeight(height, availableHeight = this.pageManager.getAvailableHeight()) {
+            return height <= availableHeight + this.fitTolerance;
+        }
+
         processBlock(element) {
             const cloned = element.cloneNode(true);
             const height = this.getElementHeight(cloned);
+            const maxPageContentHeight = this.pageManager.pageHeight - this.pageManager.padding.top - this.pageManager.padding.bottom;
+
+            // 超过单页高度的块级元素，按子节点拆分分页，避免整体塞入一页被裁切
+            if (height > maxPageContentHeight) {
+                const splitSuccess = this.processOversizedBlock(element);
+                if (splitSuccess) return;
+            }
 
             const page = this.pageManager.addContent(cloned, height);
 
@@ -613,10 +629,78 @@
             if (bgEl) {
                 const src = bgEl.getAttribute('img-src') || bgEl.getAttribute('src') || '';
                 if (src && page && page.element) {
-                    page.element.style.background = `url('${src}') center/cover no-repeat`;
+                    page.element.style.background = `url('${src}') center/contain no-repeat #fff`;
                     page.element.classList.add('nop-page-item-has-bg');
                 }
             }
+        }
+
+        getElementOpType(element) {
+            if (!element) return 'block';
+            if (element.tagName === 'TABLE') return 'table';
+            return element.getAttribute('data-op-type') || 'block';
+        }
+
+        processOverflowingChild(element, fallbackClone) {
+            const opType = this.getElementOpType(element);
+            const childHeight = this.getElementHeight(fallbackClone);
+
+            if (opType === 'table') {
+                this.processTable(element);
+                return;
+            }
+
+            if (opType === 'text') {
+                this.processText(element);
+                return;
+            }
+
+            if (element.children && element.children.length > 0) {
+                const splitSuccess = this.processOversizedBlock(element);
+                if (splitSuccess) return;
+            }
+
+            this.pageManager.addContent(fallbackClone, childHeight);
+        }
+
+        processOversizedBlock(element) {
+            const children = Array.from(element.children);
+            if (children.length === 0) return false;
+
+            const createWrapper = () => {
+                const wrapper = element.cloneNode(false);
+                return wrapper;
+            };
+
+            let currentWrapper = createWrapper();
+
+            const flushWrapper = () => {
+                if (!currentWrapper || currentWrapper.children.length === 0) return;
+                const wrapperHeight = this.getElementHeight(currentWrapper);
+                this.pageManager.addContent(currentWrapper, wrapperHeight);
+                currentWrapper = createWrapper();
+            };
+
+            for (const child of children) {
+                const childClone = child.cloneNode(true);
+                currentWrapper.appendChild(childClone);
+
+                const wrapperHeight = this.getElementHeight(currentWrapper);
+                const availableHeight = this.pageManager.getAvailableHeight();
+
+                if (this.canFitHeight(wrapperHeight, availableHeight)) {
+                    continue;
+                }
+
+                currentWrapper.removeChild(childClone);
+
+                // 先落当前已累计内容，再处理当前溢出的子节点
+                flushWrapper();
+                this.processOverflowingChild(child, childClone);
+            }
+
+            flushWrapper();
+            return true;
         }
 
         processText(element) {
@@ -707,7 +791,7 @@
                 const page = this.pageManager.getCurrentPage();
                 if (!page || !page.element) return;
 
-                page.element.style.background = `url('${src}') center/cover no-repeat`;
+                page.element.style.background = `url('${src}') center/contain no-repeat #fff`;
                 page.element.classList.add('nop-page-item-has-bg');
                 // 背景指令不参与内容高度计算，不插入到页面内容中
             } catch (e) {
@@ -785,7 +869,12 @@
 
             // Helper to get height of currentTable
             const getCurrentTableHeight = () => {
-                return this.getElementHeight(currentTable);
+                const measuringTable = currentTable.cloneNode(true);
+                const measuringTbody = measuringTable.querySelector('tbody');
+                if (measuringTbody) {
+                    this.normalizeRowspansForMeasurement(measuringTbody);
+                }
+                return this.getElementHeight(measuringTable);
             };
 
             // Calculate row groups based on rowspan
@@ -829,6 +918,10 @@
 
             while (queue.length > 0) {
                 const group = queue.shift();
+                const currentPageIndex = this.pageManager.pages.length;
+                const groupHasRowspan = group.some(row =>
+                    Array.from(row.children).some(cell => parseInt(cell.getAttribute('rowspan') || '1') > 1)
+                );
                 
                 // Try adding rows one by one
                 let addedRowsCount = 0;
@@ -839,7 +932,21 @@
                     currentTbody.appendChild(row.cloneNode(true));
                     
                     const height = getCurrentTableHeight();
-                    if (height > this.pageManager.getAvailableHeight()) {
+                    const availableHeight = this.pageManager.getAvailableHeight();
+                    const fit = this.canFitHeight(height, availableHeight);
+                    if (groupHasRowspan) {
+                        this.log('BookJS: table rowspan fit check', {
+                            page: currentPageIndex,
+                            tryRow: r + 1,
+                            groupRows: group.length,
+                            tableHeight: height,
+                            availableHeight,
+                            fit,
+                            tbodyRows: currentTbody.children.length
+                        });
+                    }
+
+                    if (!fit) {
                         // Overflow!
                         currentTbody.removeChild(currentTbody.lastChild);
                         groupFit = false;
@@ -864,8 +971,23 @@
                 const hasSplitRepeat = group.some(row => 
                     Array.from(row.children).some(cell => cell.getAttribute('data-split-repeat') === 'true')
                 );
+                const hasNoSplitClass = group.some(row =>
+                    row.classList && row.classList.contains('no-split')
+                );
 
-                if (splitStrategy !== 'precise' && !hasSplitRepeat && hasPreviousContent) {
+                if (groupHasRowspan) {
+                    this.log('BookJS: table rowspan split decision', {
+                        page: currentPageIndex,
+                        groupRows: group.length,
+                        addedRowsCount,
+                        hasPreviousContent,
+                        hasSplitRepeat,
+                        hasNoSplitClass,
+                        splitStrategy
+                    });
+                }
+
+                if (splitStrategy !== 'precise' && hasNoSplitClass && !hasSplitRepeat && hasPreviousContent) {
                     // Backtrack: remove partial group
                     for (let k = 0; k < addedRowsCount; k++) {
                         currentTbody.removeChild(currentTbody.lastChild);
@@ -888,10 +1010,25 @@
                 
                 // Group didn't fit entirely
                 if (addedRowsCount === 0) {
+                    const currentPage = this.pageManager.getCurrentPage();
+                    const pageHasExistingContent = !!(currentPage && currentPage.currentHeight > 0);
+
+                    if (groupHasRowspan) {
+                        this.log('BookJS: table rowspan zero-row fallback', {
+                            page: currentPageIndex,
+                            pageHasExistingContent,
+                            tableRowsOnPage: currentTbody.children.length,
+                            currentPageHeight: currentPage ? currentPage.currentHeight : 0,
+                            availableHeight: this.pageManager.getAvailableHeight()
+                        });
+                    }
+
                     // Even the first row doesn't fit
-                    if (currentTbody.children.length > 0) {
-                        // If we have content on this page, push to next page
-                        this.pageManager.addContent(currentTable, getCurrentTableHeight());
+                    if (currentTbody.children.length > 0 || pageHasExistingContent) {
+                        // If the page already has content before this table/group, move the group to next page.
+                        if (currentTbody.children.length > 0) {
+                            this.pageManager.addContent(currentTable, getCurrentTableHeight());
+                        }
                         this.pageManager.createNewPage();
                         
                         // Reset currentTable
@@ -913,6 +1050,13 @@
                 
                 // Split the group
                 const splitIndex = addedRowsCount;
+                if (groupHasRowspan) {
+                    this.log('BookJS: table rowspan final split', {
+                        page: currentPageIndex,
+                        splitIndex,
+                        remainingRows: group.length - splitIndex
+                    });
+                }
                 
                 // Build grid for the group to identify crossing cells
                 const grid = this.buildGrid(group);
@@ -1066,6 +1210,29 @@
                 }
             }
             return grid;
+        }
+
+        normalizeRowspansForMeasurement(tbody) {
+            const rows = Array.from(tbody.children);
+            if (rows.length === 0) return;
+
+            const grid = this.buildGrid(rows);
+            const handledCells = new Set();
+
+            for (let r = 0; r < grid.length; r++) {
+                for (let c = 0; c < grid[r].length; c++) {
+                    const cellInfo = grid[r][c];
+                    if (!cellInfo || !cellInfo.isOrigin || handledCells.has(cellInfo.cell)) continue;
+
+                    handledCells.add(cellInfo.cell);
+                    const availableRows = rows.length - cellInfo.originRow;
+                    const normalizedRowspan = Math.min(cellInfo.rowspan, availableRows);
+
+                    if (normalizedRowspan > 0 && normalizedRowspan !== cellInfo.rowspan) {
+                        cellInfo.cell.setAttribute('rowspan', normalizedRowspan);
+                    }
+                }
+            }
         }
 
         // 辅助方法

@@ -22,7 +22,6 @@
         pageSize: 'ISO_A4',
         orientation: 'portrait',
         padding: '31.8mm 25.4mm 31.8mm 25.4mm',
-        textNoBreakChars: ['，', '。', '：', '"', '！', '？', '、', '；', '》', '】', '…', '.', ',', '!', ']', '}', '｝'],
         simplePageNum: {
             enable: true,
             pageBegin: 1,
@@ -31,6 +30,9 @@
         },
         debug: false
     };
+
+    // 高度判定容差（px）：吸收亚像素测量误差，溢出部分会被 overflow:hidden 裁掉
+    const FIT_TOLERANCE = 2;
 
     // 纸张尺寸定义
     const PAGE_SIZES = {
@@ -56,11 +58,6 @@
                 }
             }
             return result;
-        },
-
-        // 生成唯一ID
-        generateId() {
-            return 'nop-' + Math.random().toString(36).substr(2, 9);
         },
 
         // 转换尺寸单位为像素
@@ -154,7 +151,7 @@
             bookContainer.className = `nop-book nop-book-preview`;
 
             // 添加页面尺寸样式
-            const pageSize = PAGE_SIZES[this.config.pageSize] || PAGE_SIZES['ISO_A4'];
+            const pageSizeName = PAGE_SIZES[this.config.pageSize] ? this.config.pageSize : 'ISO_A4';
             const orientation = this.config.orientation === 'landscape' ? 'landscape' : 'portrait';
 
             bookContainer.style.cssText = `
@@ -167,7 +164,7 @@
                 word-break: break-all;
                 --page-width: ${this.pageWidth}px;
                 --page-height: ${this.pageHeight}px;
-                --page-size: ${pageSize.name || 'ISO_A4'};
+                --page-size: ${pageSizeName};
                 --page-orientation: ${orientation};
             `;
 
@@ -240,12 +237,9 @@
                         pendant.style.position = 'absolute';
                     }
 
-                    // 替换页码占位符
+                    // 替换页码占位符；${TOTAL_PAGE} 需等全部分页完成后由 finalizePendantPlaceholders 统一替换
                     const pageNum = this.pages.length + 1; // 页码从1开始显示
-                    const totalPages = this.pages.length; // 临时值，会在后续更新
-                    pendant.innerHTML = pendant.innerHTML
-                        .replace(/\$\{PAGE\}/g, pageNum)
-                        .replace(/\$\{TOTAL_PAGE\}/g, totalPages);
+                    pendant.innerHTML = pendant.innerHTML.replace(/\$\{PAGE\}/g, pageNum);
 
                     page.appendChild(pendant);
 
@@ -292,11 +286,13 @@
             const page = this.getCurrentPage();
             const availableHeight = this.getAvailableHeight();
 
-            // 如果内容高度超过可用高度，创建新页面
-            if (height > availableHeight && availableHeight > 0) {
-                // 检查内容是否超过单页最大高度
+            // 容差与 canFitHeight 保持一致；页面已满（availableHeight <= 0）时同样必须换页，
+            // 否则内容会被塞进已满页面并因 overflow:hidden 丢失
+            if (height > availableHeight + FIT_TOLERANCE) {
                 const maxPageContentHeight = this.pageHeight - this.padding.top - this.padding.bottom;
-                if (height > maxPageContentHeight) {
+
+                // 超过单页可容纳高度的内容：放到空白页顶部，避免反复换页
+                if (height > maxPageContentHeight + FIT_TOLERANCE) {
                     console.warn('Content height exceeds single page height, adding from page top as fallback');
                     if (page.currentHeight > 0) {
                         this.createNewPage();
@@ -307,13 +303,10 @@
                     return targetPage;
                 }
 
-                this.createNewPage();
-                return this.addContent(element, height, recursionDepth + 1);
-            }
-
-            // 如果内容高度超过整个页面高度，强制添加（避免无限循环）
-            if (height > this.pageHeight - this.padding.top - this.padding.bottom) {
-                console.warn('Content height exceeds page height, forcing add to current page');
+                if (page.currentHeight > 0) {
+                    this.createNewPage();
+                    return this.addContent(element, height, recursionDepth + 1);
+                }
             }
 
             page.content.appendChild(element);
@@ -386,12 +379,9 @@
                 pendant.style.position = 'absolute';
             }
 
-            // 替换页码占位符
+            // 替换页码占位符；${TOTAL_PAGE} 需等全部分页完成后由 finalizePendantPlaceholders 统一替换
             const pageNum = this.pages.indexOf(currentPage) + 1; // 页码从1开始显示
-            const totalPages = this.pages.length;
-            pendant.innerHTML = pendant.innerHTML
-                .replace(/\$\{PAGE\}/g, pageNum)
-                .replace(/\$\{TOTAL_PAGE\}/g, totalPages);
+            pendant.innerHTML = pendant.innerHTML.replace(/\$\{PAGE\}/g, pageNum);
 
             currentPage.element.appendChild(pendant);
 
@@ -506,7 +496,7 @@
             this.config = config;
             // 复用离屏测量容器，减少重复DOM读写与强制布局
             this._measureBox = null;
-            this.fitTolerance = 2;
+            this.fitTolerance = FIT_TOLERANCE;
 
             // 调试日志门控（与 BookJS.log 行为保持一致）
             this.log = (...args) => {
@@ -530,6 +520,9 @@
             Array.from(contentBox.children).forEach(child => {
                 this.processElement(child);
             });
+
+            // 全部分页完成后，回填挂件中的总页数占位符
+            this.finalizePendantPlaceholders();
 
             // 处理页码
             this.log('检查页码配置:', this.config.simplePageNum);
@@ -756,17 +749,20 @@
             for (const lineInfo of lines) {
                 const lineClone = sourceClone.cloneNode(true);
 
-                // 移除不在该行的chunk
+                // 移除不在该行的chunk（Set 查找，避免每个span线性扫描整行id列表）
+                const lineIds = new Set(lineInfo.ids);
                 const allSpans = Array.from(lineClone.querySelectorAll('span.nop-text-chunk'));
                 for (const sp of allSpans) {
-                    const id = sp.getAttribute('data-chunk-id');
-                    if (!lineInfo.ids.includes(id)) {
+                    if (!lineIds.has(sp.getAttribute('data-chunk-id'))) {
                         sp.remove();
                     }
                 }
 
                 // 清理空节点，保留必要的内联结构
                 this.cleanupEmptyNodes(lineClone);
+
+                // 行内容确定后，把逐字符的测量span合并回纯文本，显著缩减输出DOM体积
+                this.unwrapTextChunks(lineClone);
 
                 // 设置单行样式，避免受全局break-all影响
                 lineClone.style.display = 'block';
@@ -1270,63 +1266,8 @@
             return height;
         }
 
-        getTextWidth(text, element) {
-            const temp = document.createElement('span');
-            temp.style.cssText = `
-                position: absolute;
-                visibility: hidden;
-                white-space: nowrap;
-                font: inherit;
-            `;
-            temp.textContent = text;
-
-            if (element) {
-                const computedStyle = window.getComputedStyle(element);
-                temp.style.font = computedStyle.font;
-            }
-
-            document.body.appendChild(temp);
-            const width = temp.offsetWidth;
-            document.body.removeChild(temp);
-            return width;
-        }
-
         getMaxLineWidth() {
             return this.pageManager.pageWidth - this.pageManager.padding.left - this.pageManager.padding.right;
-        }
-
-        splitText(text) {
-            const words = [];
-            let currentWord = '';
-
-            for (let i = 0; i < text.length; i++) {
-                const char = text[i];
-                currentWord += char;
-
-                if (this.config.textNoBreakChars.includes(char) ||
-                    char === ' ' || char === '\n' || char === '\t') {
-                    if (currentWord.trim()) {
-                        words.push(currentWord);
-                    }
-                    currentWord = '';
-                }
-            }
-
-            if (currentWord.trim()) {
-                words.push(currentWord);
-            }
-
-            return words;
-        }
-
-        addTextLine(text, originalElement) {
-            const line = originalElement.cloneNode(false);
-            line.textContent = text;
-            line.style.display = 'block';
-            line.style.margin = '0';
-            line.style.padding = '0';
-            const height = this.getElementHeight(line);
-            this.pageManager.addContent(line, height);
         }
 
         // 将文本节点拆分为片段span，便于基于真实布局的行识别
@@ -1364,13 +1305,23 @@
             const tokens = [];
             for (let i = 0; i < text.length; i++) {
                 const ch = text[i];
-                if (ch === '\\n') {
+                if (ch === '\n') {
                     tokens.push(' ');
                 } else {
                     tokens.push(ch);
                 }
             }
             return tokens;
+        }
+
+        // 将测量用的chunk span还原为纯文本节点（span无样式，渲染结果不变）
+        unwrapTextChunks(root) {
+            const spans = Array.from(root.querySelectorAll('span.nop-text-chunk'));
+            for (const sp of spans) {
+                sp.replaceWith(document.createTextNode(sp.textContent));
+            }
+            // 合并相邻文本节点
+            root.normalize();
         }
 
         // 移除空的元素节点，保留实际内容结构
@@ -1387,6 +1338,19 @@
             }
         }
 
+        // 分页结束后统一替换用户挂件中的 ${TOTAL_PAGE}，避免使用创建页面时的临时页数
+        finalizePendantPlaceholders() {
+            const totalPages = this.pageManager.pages.length;
+            this.pageManager.pages.forEach(page => {
+                const pendants = page.element.querySelectorAll('.nop-page-pendants:not(.pendant-pageNumSimple)');
+                pendants.forEach(pendant => {
+                    if (pendant.innerHTML.indexOf('${TOTAL_PAGE}') !== -1) {
+                        pendant.innerHTML = pendant.innerHTML.replace(/\$\{TOTAL_PAGE\}/g, totalPages);
+                    }
+                });
+            });
+        }
+
         addPageNumbers() {
             this.log('开始添加页码，配置:', this.config.simplePageNum);
             const config = this.config.simplePageNum;
@@ -1396,12 +1360,13 @@
             }
 
             this.log('页面数量:', this.pageManager.pages.length);
-            const startPage = typeof config.pageBegin === 'number' ? config.pageBegin - 1 : 0;
+            const startPage = Math.max(0, typeof config.pageBegin === 'number' ? config.pageBegin - 1 : 0);
             const endPage = config.pageEnd === -1 ? this.pageManager.pages.length - 1 : config.pageEnd - 1;
+            const lastIndex = Math.min(endPage, this.pageManager.pages.length - 1);
 
             // 统计存在有效 pendants 的页面数量（不含已生成的页脚）
             let totalPagesWithPendants = 0;
-            for (let i = startPage; i <= endPage && i < this.pageManager.pages.length; i++) {
+            for (let i = startPage; i <= lastIndex; i++) {
                 const page = this.pageManager.pages[i];
                 const hasValidPendants = !!page.element.querySelector('.nop-page-pendants:not(.pendant-pageNumSimple)');
                 if (hasValidPendants) {
@@ -1411,15 +1376,22 @@
 
             this.log('有有效 pendants 的页面总数:', totalPagesWithPendants);
 
-            // 仅对存在有效 pendants 的页面递增页码
+            // 整个范围内都没有 pendants（如未使用 data-op-type="pendants" 的简单文档）时，
+            // 回退为对范围内所有页面编号，保证 simplePageNum 配置生效
+            const numberAllPages = totalPagesWithPendants === 0;
+            const totalNumberedPages = numberAllPages
+                ? Math.max(0, lastIndex - startPage + 1)
+                : totalPagesWithPendants;
+
+            // 仅对参与编号的页面递增页码
             let pageNumCounter = 1;
 
-            for (let i = startPage; i <= endPage && i < this.pageManager.pages.length; i++) {
+            for (let i = startPage; i <= lastIndex; i++) {
                 const page = this.pageManager.pages[i];
 
                 // 检查页面是否存在有效 pendants（排除页脚本身）
                 const hasValidPendants = !!page.element.querySelector('.nop-page-pendants:not(.pendant-pageNumSimple)');
-                if (!hasValidPendants) {
+                if (!numberAllPages && !hasValidPendants) {
                     this.log(`第 ${i + 1} 页没有有效 pendants，跳过页脚添加`);
                     continue;
                 }
@@ -1429,7 +1401,7 @@
                 existingFooters.forEach(footer => footer.remove());
 
                 const currentPageNum = pageNumCounter;
-                const totalPages = totalPagesWithPendants;
+                const totalPages = totalNumberedPages;
 
                 const pendant = document.createElement('div');
 

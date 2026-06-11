@@ -38,9 +38,6 @@ window.bookConfig = {
   orientation: 'portrait', // 页面方向：portrait (纵向), landscape (横向)
   padding: '31.8mm 25.4mm 31.8mm 25.4mm', // 页边距 (上 右 下 左)
   debug: false, // 开启调试模式（输出日志并在页面显示调试工具栏）
-  
-  // 文本自动换行时的避头尾字符
-  textNoBreakChars: ['，', '。', '：', '"', '！', '？', '、', '；', '》', '】', '…', '.', ',', '!', ']', '}', '｝'],
 
   // 简易页码配置
   simplePageNum: {

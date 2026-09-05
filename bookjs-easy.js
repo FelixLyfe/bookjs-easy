@@ -1,6 +1,6 @@
 /*!
  * BookJS-Easy - WEB Print Auto Pagination / Preview / Make PDF
- * Version: 2.1.0
+ * Version: 2.1.1
  * Author: Felix Lyu
  * License: MIT
  */
@@ -654,8 +654,7 @@
             return this.pageManager.addContent(this.wrapContent(element));
         }
 
-        processNestedTable(fragment) {
-            const table = fragment.querySelector('table');
+        processNestedTable(fragment, table = fragment.querySelector('table')) {
             if (!table) return false;
             const slot = document.createComment('table');
             table.replaceWith(slot);
@@ -793,7 +792,19 @@
                     range.setEnd(end.node, end.offset);
                     const clone = template.cloneNode(true);
                     const fill = (fillSelector && clone.querySelector(fillSelector)) || clone;
-                    fill.appendChild(range.cloneContents());
+                    let contents = range.cloneContents();
+                    // Range 不复制共同祖先；页首/页尾落在同一内联标签内时补回这条路径。
+                    if (from !== to) {
+                        let ancestor = range.commonAncestorContainer;
+                        if (ancestor.nodeType !== Node.ELEMENT_NODE) ancestor = ancestor.parentNode;
+                        while (ancestor !== source) {
+                            const wrapper = ancestor.cloneNode(false);
+                            wrapper.appendChild(contents);
+                            contents = wrapper;
+                            ancestor = ancestor.parentNode;
+                        }
+                    }
+                    fill.appendChild(contents);
                     return clone;
                 }
             };
@@ -1042,6 +1053,19 @@
                             continue;
                         }
                     }
+                    // 单列容器中的内表继续走表格分页，避免先把缩进空白输出成一页。
+                    const cell = rows[0].cells.length === 1 ? rows[0].cells[0] : null;
+                    if (cell?.rowSpan === 1 && cell.getAttribute('data-split-repeat') !== 'true' &&
+                        cell.children.length === 1 && cell.firstElementChild.tagName === 'TABLE' &&
+                        !Array.from(cell.childNodes).some(node => node.nodeType === Node.TEXT_NODE && node.textContent.trim())) {
+                        flush();
+                        const nested = newTable();
+                        const row = rows[0].cloneNode(true);
+                        nested.table.tBodies[group.section].appendChild(row);
+                        this.processNestedTable(nested.root, row.cells[0].firstElementChild);
+                        current = newTable();
+                        continue;
+                    }
                     // 超高行直接利用当前页剩余空间，避免把前面的标题单独留在一页。
                     const head = rows[0].cloneNode(true);
                     const tail = rows[0].cloneNode(true);
@@ -1077,7 +1101,7 @@
                         const split = fits(fragmenter.make(0, end)) ? end : this.findFittingPoint(fragmenter, 0, fits);
                         head.cells[index].replaceChildren(...Array.from(fragmenter.make(0, split).childNodes));
                         tail.cells[index].replaceChildren(...Array.from(fragmenter.make(split, end).childNodes));
-                        progressed = progressed || (split > 0 && !!(head.cells[index].textContent.trim() || head.cells[index].querySelector('img,svg,canvas')));
+                        progressed = progressed || split > 0;
                         remaining = remaining || split < end;
                     });
                     if (!progressed || !remaining) {
@@ -1410,10 +1434,19 @@
 
         render(force = false) {
             if (this._renderPromise) {
-                if (force) this._rerenderRequested = true;
+                if (force) {
+                    this._stopped = false;
+                    this._requestedStart = true;
+                    this._rerenderRequested = true;
+                    this.isRendered = false;
+                    window.status = '';
+                    this._renderAbort?.abort();
+                }
                 return this._renderPromise;
             }
             if (this.isRendered && !force) return Promise.resolve(this);
+            this.isRendered = false;
+            window.status = '';
             this._stopped = false;
             this._requestedStart = true;
             this._hasFailed = false;
@@ -1429,6 +1462,9 @@
 
         async performRender() {
             if (this._stopped) throw new DOMException('Render cancelled', 'AbortError');
+            this._rerenderRequested = false;
+            clearTimeout(this._observerTimeout);
+            this._observerTimeout = null;
             let signal;
             try {
                 this.config = this.getConfig();
@@ -1455,22 +1491,25 @@
                 this.contentProcessor?.cleanup();
                 this.pageManager = new PageManager(this.config);
                 this.contentProcessor = new ContentProcessor(this.pageManager, this.config);
+                this.addPrintStyles();
                 document.dispatchEvent(new CustomEvent('book.before-render'));
 
                 await this.waitForResources(source, signal);
                 if (signal.aborted) throw new DOMException('Render cancelled', 'AbortError');
+                // 内容或配置已变化时，下一轮重新等待最新资源，旧快照不能宣布完成。
+                if (this._rerenderRequested) return this;
                 this.contentProcessor.processContent(source);
                 this.contentProcessor.cleanup();
-                this.addPrintStyles();
                 this.isRendered = true;
                 this._requestedStart = false;
                 clearInterval(this._renderCheckInterval);
                 this._renderCheckInterval = null;
-                this.triggerCompleteEvent();
+                this.triggerCompleteEvent(signal);
                 await this.waitForDelay(Math.max(0, Number(this.config.printDelay) || 0), signal);
                 if (!this._rerenderRequested) window.status = 'PDFComplete';
                 return this;
             } catch (error) {
+                if (this._rerenderRequested && !this._stopped) return this;
                 this.isRendered = false;
                 this._hasFailed = true;
                 this._requestedStart = false;
@@ -1524,8 +1563,8 @@
                         clearTimeout(timeout);
                         signal.removeEventListener('abort', aborted);
                     });
+                    Promise.all(tasks).then(resolve, reject);
                     if (signal.aborted) aborted();
-                    else Promise.all(tasks).then(resolve, reject);
                 });
             } finally {
                 cleanups.forEach(cleanup => cleanup());
@@ -1558,7 +1597,17 @@
             if (source && !this.getConfig().observeContent) return;
             this._domObserver = new MutationObserver(() => {
                 if (this._stopped) return;
+                if (this.isRendered || this._renderPromise) {
+                    this._requestedStart = true;
+                    this.isRendered = false;
+                    window.status = '';
+                }
                 clearTimeout(this._observerTimeout);
+                if (this._renderPromise) {
+                    this._rerenderRequested = true;
+                    this._renderAbort?.abort();
+                    return;
+                }
                 this._observerTimeout = setTimeout(() => {
                     this._observerTimeout = null;
                     if (this._stopped) return;
@@ -1662,13 +1711,14 @@
             `;
         }
 
-        triggerCompleteEvent() {
+        triggerCompleteEvent(signal) {
             const info = {
                 PAGE_BEGIN_INDEX: 0,
                 PAGE_END_INDEX: this.pageManager.pages.length - 1,
                 TOTAL_PAGE: this.pageManager.pages.length
             };
             document.dispatchEvent(new CustomEvent('book.before-complete', { detail: info }));
+            if (signal?.aborted) throw new DOMException('Render cancelled', 'AbortError');
             document.dispatchEvent(new CustomEvent('book.after-complete', { detail: info }));
         }
 

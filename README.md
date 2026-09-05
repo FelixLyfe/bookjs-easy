@@ -1,8 +1,8 @@
-# BookJS-Easy v2.1.0
+# BookJS-Easy v2.1.1
 
 ## 概述
 
-BookJS-Easy 是一个无需第三方运行时依赖的浏览器自动分页与打印预览工具，可通过浏览器打印生成 PDF。v2.1.0 改进文本分页性能，修复文本、表格和动态渲染中的内容裁切问题。
+BookJS-Easy 是一个无需第三方运行时依赖的浏览器自动分页与打印预览工具，可通过浏览器打印生成 PDF。v2.1.1 修复纸张尺寸变更后的重新分页、跨页富文本格式丢失，以及内容更新和取消时的打印就绪状态。
 
 ## 主要特性
 
@@ -17,6 +17,7 @@ BookJS-Easy 是一个无需第三方运行时依赖的浏览器自动分页与�
   - 针对 `rowspan` 场景优化高度测量，降低临界高度误判。
   - 支持表头（Thead）自动重复。
   - 支持 `data-split-repeat` 属性让特定单元格在跨页后重复内容。
+  - 单元格内的纯换行可以续接；独占一行的单个单元格仅包含内表时，可继续分页并重复内外表头。
 - **标题防孤悬**: 自动检测 H1-H6 标题后的内容，避免标题单独留在页尾。
 - **页眉页脚系统**: 支持动态页码 (`${PAGE}`, `${TOTAL_PAGE}`) 和自定义 HTML 模板。
 - **调试模式**: 内置调试工具栏，支持快速跳转页面和打印预览。
@@ -148,16 +149,18 @@ window.bookConfig = {
 返回 Promise；等待资源后完成分页。`force = true` 可强制重新渲染。源容器不存在或为空时继续等待；此时返回的 Promise 不代表已有分页结果，应使用 `book.after-complete` 或 `window.status` 判断就绪。
 
 ### `book.forceRender()`
-等价于 `render(true)`，返回 Promise；运行中的重复请求合并为一次后续渲染。
+等价于 `render(true)`，返回 Promise；运行中的重复请求合并为一次后续渲染。调用后立即清除旧的就绪状态，并停止等待已被替换内容的资源。修改纸张尺寸或方向后，会按新尺寸重新测量和分页。
 
 ### `book.cleanup()`
 停止 DOM 监听、配置轮询，取消待执行的渲染，并移除测量容器。需要恢复时调用 `forceRender()`。
 
 ### 渲染事件与打印就绪
 
-原生 `document` 事件顺序为 `book.before-render` → `book.before-complete` → `book.after-complete`。后两个事件触发时 `isRendered` 已为 `true`；`event.detail` 含 `PAGE_BEGIN_INDEX`、`PAGE_END_INDEX`、`TOTAL_PAGE`，表示实际页面范围。渲染失败触发 `book.abort`，`event.detail.error` 为错误对象，也可使用 `errorCallback(error)`。
+原生 `document` 事件顺序为 `book.before-render` → `book.before-complete` → `book.after-complete`。后两个事件触发时 `isRendered` 已为 `true`；`event.detail` 含 `PAGE_BEGIN_INDEX`、`PAGE_END_INDEX`、`TOTAL_PAGE`，表示实际页面范围。在 `book.before-complete` 中调用 `cleanup()` 可取消后续完成事件；取消时 Promise 以 `AbortError` 拒绝。渲染失败触发 `book.abort`，`event.detail.error` 为错误对象，也可使用 `errorCallback(error)`。
 
 成功后经过 `printDelay` 将 `window.status` 设为 `PDFComplete`；失败、内容为空或重新渲染时清除此状态。
+
+开启 `observeContent` 时，DOM 变更通知会立即使 `isRendered` 和 `PDFComplete` 失效，实际重排仍合并执行。内容在资源加载期间更新时，会重新等待最新内容的图片和字体后再发出完成事件。
 
 ```javascript
 // 确保源内容已经准备好，再等待分页完成。
@@ -186,6 +189,8 @@ await BookJS.instance.forceRender();
 ### 4. 表格跨页问题
 如果表格行包含复杂的 `rowspan`，BookJS 会尝试保持行的完整性，并对跨页测量做额外修正以减少误判。如果一行实在太高放不下，它会尝试拆分。你可以使用 `data-split-strategy="precise"` 强制拆分，使用 `data-split-repeat="true"` 让拆分后的单元格重复显示内容（例如序号列），或者在希望尽量整体后移的 `tr` 上添加 `class="no-split"`。
 
+内表的跨页续接目前支持：外层行仅有一个 `rowspan="1"` 的单元格（可以设置 `colspan`），该单元格仅包含一张表格及空白。多列中并排的超高内表、与普通内容混排的超高内表，仍可能因无法拆分而拒绝渲染。
+
 ## License
 
 MIT
@@ -202,6 +207,6 @@ npm run check
 npm test
 ```
 
-可用 `BOOKJS_CHROME` 指定浏览器可执行文件。20 个回归样例使用真实浏览器布局，覆盖文本完整性、盒子、表格、异步资源、重复渲染及失败/取消路径。
+可用 `BOOKJS_CHROME` 指定浏览器可执行文件。30 个回归样例使用真实浏览器布局，覆盖文本及格式完整性、盒子、表格、异步资源、纸张重排和失败/取消路径。
 
 目前自动化回归已在 Chrome 中验证。

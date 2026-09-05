@@ -300,3 +300,155 @@ test('a heading stays with a splittable row that would fit on a fresh page', asy
     assert.equal(await page.locator('.nop-page-item').first().locator('table').count(), 1);
     await assertFits(page);
 });
+
+test('changing paper width repaginates with the same layout as a fresh render', async t => {
+    const content = Array.from({ length: 9 }, (_, i) => `<p data-op-type="text">${i}: ${'resize content '.repeat(18)}</p>`).join('');
+    const narrow = { pageSizeOption: { width: '240px', height: '220px' }, padding: '10px' };
+    const { page } = await fixture(t, content, { ...narrow, pageSizeOption: { width: '480px', height: '220px' } });
+    await render(page);
+    await page.evaluate(async config => {
+        Object.assign(bookConfig, config);
+        await BookJS.instance.forceRender();
+    }, narrow);
+    await assertFits(page);
+    const { page: fresh } = await fixture(t, content, narrow);
+    await render(fresh);
+    const contents = p => p.locator('.nop-page-content').allTextContents();
+    assert.deepEqual(await contents(page), await contents(fresh));
+});
+
+test('adjacent inline nodes preserve spaces at a page boundary', async t => {
+    const { page } = await fixture(t, '<p data-op-type="text" class="inline"><span>AAAA</span> <strong>BBBB</strong> CCCC DDDD</p>', {
+        pageSizeOption: { width: '80px', height: '40px' }, padding: '10px'
+    }, '.inline{font-family:monospace;font-size:16px;line-height:20px}');
+    const expected = await page.locator('#content-box .inline').textContent();
+    await render(page);
+    assert.equal((await page.locator('.nop-book .inline').allTextContents()).join(''), expected);
+    await assertFits(page);
+});
+
+test('formatting and links remain around text that spans several pages', async t => {
+    const text = 'formatted linked content '.repeat(180);
+    const { page } = await fixture(t, `<p data-op-type="text"><strong><a href="#target"><em>${text}</em></a></strong></p>`);
+    await render(page);
+    assert.equal((await page.locator('.nop-book p').allTextContents()).join(''), text);
+    assert.equal((await page.locator('.nop-book p > strong > a[href="#target"] > em').allTextContents()).join(''), text);
+    await assertFits(page);
+});
+
+test('a table cell containing only line breaks can continue across pages', async t => {
+    const { page } = await fixture(t, `<table data-op-type="table"><tbody><tr><td class="breaks">${'<br>'.repeat(35)}</td></tr></tbody></table>`);
+    await render(page);
+    assert.equal(await page.locator('.nop-book .breaks br').count(), 35);
+    await assertFits(page);
+});
+
+test('a nested table in a tall cell keeps every row and repeated header', async t => {
+    const rows = Array.from({ length: 12 }, (_, i) => `<tr><td>nested-row-${i}</td></tr>`).join('');
+    const { page } = await fixture(t, `<table data-op-type="table" class="outer-table"><tbody><tr><td>\n  <table class="inner-table"><thead><tr><th>Nested head</th></tr></thead><tbody>${rows}</tbody></table>\n</td></tr></tbody></table>`, {}, '.inner-table tbody tr{height:35px}');
+    await render(page);
+    assert.deepEqual(await page.locator('.nop-book .inner-table tbody td').allTextContents(), Array.from({ length: 12 }, (_, i) => `nested-row-${i}`));
+    assert.equal(await page.locator('.nop-book .inner-table thead').count(), await page.locator('.nop-book .inner-table').count());
+    assert.ok(await page.locator('.nop-page-item').first().locator('.inner-table tbody tr').count() > 0, 'indentation must not create an empty leading page');
+    await assertFits(page);
+});
+
+test('nested table continuations preserve outer rows, merged columns and both headers', async t => {
+    const rows = Array.from({ length: 9 }, (_, i) => `<tr>${i === 0 ? '<td rowspan="9" data-split-repeat="true">group</td>' : ''}<td class="value">nested-${i}</td></tr>`).join('');
+    const { page } = await fixture(t, `<section data-op-type="table"><table class="outer-table">
+        <thead><tr><th>Outer left</th><th>Outer right</th></tr></thead><tbody>
+        <tr><td class="value">before-left</td><td class="value">before-right</td></tr>
+        <tr><td colspan="2"><table class="inner-table"><thead><tr><th colspan="2">Inner head</th></tr></thead><tbody>${rows}</tbody></table></td></tr>
+        <tr><td class="value">after-left</td><td class="value">after-right</td></tr>
+        </tbody><tfoot><tr><td colspan="2">Outer foot</td></tr></tfoot></table></section>`, {}, '.inner-table tbody tr{height:40px}');
+    await render(page);
+    assert.deepEqual(await page.locator('.nop-book .value').allTextContents(), ['before-left', 'before-right', ...Array.from({ length: 9 }, (_, i) => `nested-${i}`), 'after-left', 'after-right']);
+    assert.ok(await page.locator('.nop-book .inner-table').count() > 1);
+    assert.equal(await page.locator('.nop-book .outer-table > thead').count(), await page.locator('.nop-book .outer-table').count());
+    assert.equal(await page.locator('.nop-book .inner-table > thead').count(), await page.locator('.nop-book .inner-table').count());
+    await assertFits(page);
+});
+
+test('source changes invalidate print readiness before the debounced rerender', async t => {
+    const { page } = await fixture(t, '<p>old contents</p>');
+    await render(page);
+    const pending = await page.evaluate(async () => {
+        document.querySelector('#content-box p').textContent = 'new contents';
+        await Promise.resolve();
+        return { rendered: BookJS.instance.isRendered, status: window.status };
+    });
+    assert.equal(pending.rendered, false);
+    assert.notEqual(pending.status, 'PDFComplete');
+    await page.waitForFunction(() => document.querySelector('.nop-book p')?.textContent === 'new contents' && window.status === 'PDFComplete');
+});
+
+test('an image added during resource loading cannot publish premature completion', async t => {
+    const { page } = await fixture(t, '<p>dynamic resources</p>');
+    const held = new Map();
+    await page.route('https://assets.test/live-*.svg', async route => {
+        await new Promise(resolve => held.set(route.request().url(), resolve));
+        await route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="50" height="50"/>' }).catch(() => {});
+    });
+    t.after(() => { for (const release of held.values()) release(); });
+    await page.evaluate(() => {
+        document.querySelector('#content-box').insertAdjacentHTML('beforeend', '<img src="https://assets.test/live-first.svg">');
+        window.liveRender = BookJS.instance.render();
+    });
+    await page.waitForFunction(() => !!document.querySelector('.nop-measure-box img'));
+    await Promise.all([
+        page.waitForRequest('https://assets.test/live-second.svg'),
+        page.evaluate(() => {
+            document.querySelector('#content-box').insertAdjacentHTML('beforeend', '<img src="https://assets.test/live-second.svg">');
+        })
+    ]);
+    held.get('https://assets.test/live-first.svg')();
+    await page.waitForTimeout(50);
+    assert.equal(await page.evaluate(() => BookJS.instance.isRendered), false);
+    assert.deepEqual(await page.evaluate(() => events.filter(event => event.name === 'book.after-complete')), []);
+    held.get('https://assets.test/live-second.svg')();
+    await page.evaluate(() => liveRender);
+    assert.equal(await page.locator('.nop-book img').count(), 2);
+    assert.equal(await page.evaluate(() => [...document.querySelectorAll('.nop-book img')].every(img => img.complete && img.naturalWidth > 0)), true);
+    await assertFits(page);
+});
+
+test('a superseded resource failure resolves with the replacement content', async t => {
+    const { page, errors } = await fixture(t, '<p>replacement</p>');
+    let release;
+    const held = new Promise(resolve => { release = resolve; });
+    await page.route('https://assets.test/replaced.svg', async route => {
+        await held;
+        await route.abort().catch(() => {});
+    });
+    t.after(release);
+    await page.evaluate(() => {
+        document.querySelector('#content-box').insertAdjacentHTML('beforeend', '<img src="https://assets.test/replaced.svg">');
+        window.replacedRender = BookJS.instance.render();
+    });
+    await page.waitForFunction(() => !!document.querySelector('.nop-measure-box img'));
+    await page.evaluate(() => { document.querySelector('#content-box img').remove(); });
+    await page.evaluate(() => Promise.race([
+        replacedRender,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('replacement is waiting for an obsolete image')), 1000))
+    ]));
+    release();
+    assert.equal(await page.locator('.nop-book p').textContent(), 'replacement');
+    assert.equal(await page.evaluate(() => window.status), 'PDFComplete');
+    assert.equal(await page.evaluate(() => events.filter(event => event.name === 'book.after-complete').length), 1);
+    assert.equal(await page.evaluate(() => events.filter(event => event.name === 'book.abort').length), 0);
+    assert.deepEqual(errors, []);
+});
+
+test('cancelling from before-complete cannot emit after-complete', async t => {
+    const { page } = await fixture(t, '<p>cancel from callback</p>');
+    await page.evaluate(() => {
+        document.addEventListener('book.before-complete', () => BookJS.instance.cleanup(), { once: true });
+    });
+    const result = await page.evaluate(async () => {
+        try { await BookJS.instance.render(); } catch (error) { return error.name; }
+    });
+    assert.equal(result, 'AbortError');
+    assert.equal(await page.evaluate(() => events.filter(event => event.name === 'book.after-complete').length), 0);
+    assert.notEqual(await page.evaluate(() => window.status), 'PDFComplete');
+    assert.equal(await page.locator('.nop-book, .nop-measure-box').count(), 0);
+});

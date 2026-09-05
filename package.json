@@ -1,6 +1,6 @@
 {
   "name": "bookjs-easy",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Dependency-free browser pagination and print preview",
   "main": "bookjs-easy.js",
   "license": "MIT",

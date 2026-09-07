@@ -1,6 +1,6 @@
 /*!
  * BookJS-Easy - WEB Print Auto Pagination / Preview / Make PDF
- * Version: 2.1.1
+ * Version: 2.2.0
  * Author: Felix Lyu
  * License: MIT
  */
@@ -114,6 +114,7 @@
         constructor(config) {
             this.config = config;
             this.pages = [];
+            this.pendantTemplates = [];
             this.currentPage = null;
             this.pageHeight = 0;
             this.pageWidth = 0;
@@ -247,43 +248,11 @@
                 pendants: []
             };
 
-            // 复制上一页的pendants到新页面（除非上一页已清除pendants）
-            if (this.currentPage && this.currentPage.pendants.length > 0 && !this.currentPage.pendantsCleared) {
-                if (this.config && this.config.debug) console.log('BookJS: Copying pendants from page', this.pages.indexOf(this.currentPage), 'to new page');
-                this.currentPage.pendants.forEach(pendantInfo => {
-                    const pendant = pendantInfo.element.cloneNode(true);
-                    pendant.className += ' nop-page-pendants';
-
-                    // 添加pendant唯一标识
-                    if (pendantInfo.pendantId) {
-                        pendant.className += ' ' + pendantInfo.pendantId;
-                    }
-
-                    // 检查计算样式而不是内联样式，避免覆盖CSS类样式
-                    const computedStyle = window.getComputedStyle(pendantInfo.originalElement);
-                    if (computedStyle.position === 'static' || computedStyle.position === '') {
-                        pendant.style.position = 'absolute';
-                    }
-
-                    // 替换页码占位符；${TOTAL_PAGE} 需等全部分页完成后由 finalizePendantPlaceholders 统一替换
-                    const pageNum = this.pages.length + 1; // 页码从1开始显示
-                    pendant.innerHTML = pendant.innerHTML.replace(/\$\{PAGE\}/g, pageNum);
-
-                    page.appendChild(pendant);
-
-                    // 将pendant信息存储到新页面
-                    pageObj.pendants.push({
-                        element: pendantInfo.originalElement.cloneNode(true),
-                        originalElement: pendantInfo.originalElement,
-                        pendantId: pendantInfo.pendantId
-                    });
-                });
-            } else if (this.currentPage && this.currentPage.pendantsCleared) {
-                if (this.config && this.config.debug) console.log('BookJS: Skipping pendant copy due to pendantsCleared flag on page', this.pages.indexOf(this.currentPage));
-            }
-
             this.pages.push(pageObj);
             this.currentPage = pageObj;
+            const templates = this.pendantTemplates;
+            this.pendantTemplates = [];
+            templates.forEach(element => this.addPendant(element));
 
             return pageObj;
         }
@@ -342,10 +311,9 @@
             return page;
         }
 
-        addPendant(element) {
+        addPendant(element, applyCurrentPage = true) {
             // 只添加到当前页面，而不是所有页面
             const currentPage = this.getCurrentPage();
-            currentPage.pendantsCleared = false;
 
             // 生成pendant的特征指纹，用于识别同类pendant并进行去重替换
             // 策略：tagName + sorted classList (过滤掉nop-前缀和pendant-id-)
@@ -363,23 +331,17 @@
             // 优先检查 data-pendant-key (兼容手动指定)，如果没有则回退到自动特征匹配
             const pendantKey = element.getAttribute('data-pendant-key') || element.getAttribute('data-pendant-name');
             
-            const existingIndex = currentPage.pendants.findIndex(p => {
-                // 1. 如果有显式 key，优先匹配 key
-                const pKey = p.element.getAttribute('data-pendant-key') || p.element.getAttribute('data-pendant-name');
-                if (pendantKey && pKey) {
-                    return pendantKey === pKey;
-                }
-                
-                // 2. 如果没有显式 key，尝试特征匹配
-                // 只有当新旧元素都没有显式 key 时才进行特征匹配，避免误杀
-                if (!pendantKey && !pKey) {
-                    const pSignature = getPendantSignature(p.originalElement);
-                    return newSignature === pSignature && newSignature !== 'div|'; // 忽略没有任何类名的空div
-                }
-                
-                return false;
-            });
-            
+            const matches = candidate => {
+                const key = candidate.getAttribute('data-pendant-key') || candidate.getAttribute('data-pendant-name');
+                if (pendantKey || key) return pendantKey === key;
+                return newSignature !== 'div|' && newSignature === getPendantSignature(candidate);
+            };
+            const templateIndex = this.pendantTemplates.findIndex(matches);
+            if (templateIndex >= 0) this.pendantTemplates.splice(templateIndex, 1);
+            this.pendantTemplates.push(element.cloneNode(true));
+            if (!applyCurrentPage) return;
+            const existingIndex = currentPage.pendants.findIndex(p => matches(p.originalElement));
+
             if (existingIndex !== -1) {
                 const existing = currentPage.pendants[existingIndex];
                 if (this.config && this.config.debug) console.log('BookJS: Replacing pendant with signature', newSignature);
@@ -403,7 +365,8 @@
             pendant.className += ' ' + pendantId;
 
             // 检查计算样式而不是内联样式，避免覆盖CSS类样式
-            const computedStyle = window.getComputedStyle(element);
+            currentPage.element.appendChild(pendant);
+            const computedStyle = window.getComputedStyle(pendant);
             if (computedStyle.position === 'static' || computedStyle.position === '') {
                 pendant.style.position = 'absolute';
             }
@@ -411,8 +374,6 @@
             // 替换页码占位符；${TOTAL_PAGE} 需等全部分页完成后由 finalizePendantPlaceholders 统一替换
             const pageNum = this.pages.indexOf(currentPage) + 1; // 页码从1开始显示
             pendant.innerHTML = pendant.innerHTML.replace(/\$\{PAGE\}/g, pageNum);
-
-            currentPage.element.appendChild(pendant);
 
             // 将pendant信息存储到当前页面，用于后续页面复制
             currentPage.pendants.push({
@@ -422,7 +383,9 @@
             });
         }
 
-        clearPendants() {
+        clearPendants(applyCurrentPage = true) {
+            this.pendantTemplates = [];
+            if (!applyCurrentPage) return;
             // 清除当前页面的pendants继承
             const currentPage = this.getCurrentPage();
             if (currentPage) {
@@ -436,8 +399,6 @@
                 });
 
                 currentPage.pendants = [];
-                // 添加标记，表示pendants已被清除，不应该继承到后续页面
-                currentPage.pendantsCleared = true;
             }
         }
 
@@ -573,6 +534,17 @@
         }
 
         processElement(element) {
+            const rawParams = element.getAttribute('data-op-param');
+            const params = rawParams ? JSON.parse(rawParams) : {};
+            if (!Utils.isPlainObject(params)) throw new TypeError('BookJS: data-op-param must be a JSON object');
+            const opType = this.getElementOpType(element);
+            if (['block', 'text', 'text-box', 'block-box', 'mix-box', 'table'].includes(opType) && params.bottomOffset !== undefined) {
+                const offset = Utils.convertToPixels(params.bottomOffset);
+                if (offset < 0) throw new RangeError('BookJS: bottomOffset cannot be negative');
+                if (this.pageManager.getCurrentPage().currentHeight > 0 && this.pageManager.getAvailableHeight() < offset) {
+                    this.pageManager.createNewPage();
+                }
+            }
             // Keep With Next Check
             if (/^H[1-6]$/i.test(element.tagName)) {
                 const next = element.nextElementSibling;
@@ -615,8 +587,6 @@
                 }
             }
 
-            const opType = this.getElementOpType(element);
-
             switch (opType) {
                 case 'block':
                     this.processBlock(element);
@@ -633,7 +603,7 @@
                     this.processNewPage();
                     break;
                 case 'pendants':
-                    this.processPendants(element);
+                    this.processPendants(element, params);
                     break;
                 case 'table':
                     this.processTable(element);
@@ -925,29 +895,12 @@
             }
         }
 
-        processPendants(element) {
-        this.log('BookJS: processPendants called', element);
-            // 检查是否有实际的pendant内容
-            const hasValidPendants = Array.from(element.children).some(child => {
-                return child.textContent.trim() || child.querySelector('img, svg, canvas') || child.children.length > 0;
-            });
-
-        this.log('BookJS: hasValidPendants:', hasValidPendants);
-
-            if (hasValidPendants) {
-                // 只处理有内容的pendant子元素
-                Array.from(element.children).forEach(child => {
-                    // 检查子元素是否有实际内容
-                    if (child.textContent.trim() || child.querySelector('img, svg, canvas') || child.children.length > 0) {
-                    this.log('BookJS: Adding pendant:', child);
-                        this.pageManager.addPendant(child);
-                    }
-                });
-            } else {
-                // 如果pendants元素为空，清除当前页面的pendants继承
-            this.log('BookJS: Empty pendants element, calling clearPendants');
-                this.pageManager.clearPendants();
-            }
+        processPendants(element, params = {}) {
+            const applyCurrentPage = params.applyCurrentPage !== false;
+            const children = Array.from(element.children);
+            // 未配置 overflow 时保持同名替换；显式 true 替换整组模板。
+            if (params.overflow === true || !children.length) this.pageManager.clearPendants(applyCurrentPage);
+            children.forEach(child => this.pageManager.addPendant(child, applyCurrentPage));
         }
 
         processTable(element) {
@@ -1326,6 +1279,13 @@
                 return;
             }
 
+            for (const key of ['pageBegin', 'pageEnd']) {
+                const value = config[key];
+                const number = typeof value === 'string' && /^-?\d+$/.test(value.trim()) ? Number(value) : value;
+                if (!Number.isSafeInteger(number)) throw new TypeError(`BookJS: ${key} must be an integer`);
+                config[key] = number;
+            }
+
             this.log('页面数量:', this.pageManager.pages.length);
             const startPage = Math.max(0, typeof config.pageBegin === 'number' ? config.pageBegin - 1 : 0);
             const endPage = config.pageEnd === -1 ? this.pageManager.pages.length - 1 : config.pageEnd - 1;
@@ -1400,6 +1360,7 @@
         }
 
         getContentBox(config = this.getConfig()) {
+            if (config.contentItemIterator != null) return null;
             return typeof config.contentBox === 'string' ? document.querySelector(config.contentBox) : config.contentBox;
         }
 
@@ -1468,7 +1429,12 @@
             let signal;
             try {
                 this.config = this.getConfig();
-                const source = this.getContentBox(this.config);
+                this._renderAbort = new AbortController();
+                signal = this._renderAbort.signal;
+                this.setupDOMObserver();
+                const source = this.config.contentItemIterator == null
+                    ? this.getContentBox(this.config) : await this.collectContent(signal);
+                if (signal.aborted) throw new DOMException('Render cancelled', 'AbortError');
                 if (!source || source.children.length === 0) {
                     this.isRendered = false;
                     window.status = '';
@@ -1477,13 +1443,16 @@
                     this.contentProcessor = null;
                     this.pageManager = null;
                     this.setupDOMObserver();
-                    this.watchConfig();
+                    if (this.config.contentItemIterator == null) this.watchConfig();
+                    else {
+                        this._requestedStart = false;
+                        clearInterval(this._renderCheckInterval);
+                        this._renderCheckInterval = null;
+                    }
                     return this;
                 }
                 this.isRendered = false;
                 window.status = '';
-                this._renderAbort = new AbortController();
-                signal = this._renderAbort.signal;
                 this._domObserver?.disconnect();
                 source.style.display = 'none';
                 this._observedSource = null;
@@ -1524,7 +1493,61 @@
                 }
                 throw error;
             } finally {
+                if (!this.isRendered) this._renderAbort?.abort();
                 this._renderAbort = null;
+            }
+        }
+
+        async collectContent(signal) {
+            const source = document.createElement('div');
+            let active = true;
+            let iterator;
+            let completed = false;
+            let timeout;
+            let aborted;
+            const check = () => {
+                if (!active || signal.aborted) throw new DOMException('Render cancelled', 'AbortError');
+            };
+            const collect = async () => {
+                let input = this.config.contentItemIterator;
+                if (typeof input === 'function') input = input({ signal });
+                input = await input;
+                check();
+                if (input?.nodeType === Node.ELEMENT_NODE) input = [input];
+                if (!input || typeof input === 'string') throw new TypeError('BookJS: contentItemIterator must supply DOM elements');
+                const iterate = input[Symbol.asyncIterator] || input[Symbol.iterator];
+                if (typeof iterate !== 'function') throw new TypeError('BookJS: contentItemIterator must be iterable');
+                iterator = iterate.call(input);
+                let count = 0;
+                while (true) {
+                    check();
+                    const step = await iterator.next();
+                    check();
+                    if (step.done) { completed = true; break; }
+                    if (step.value?.nodeType !== Node.ELEMENT_NODE) throw new TypeError('BookJS: contentItemIterator items must be DOM elements');
+                    source.appendChild(step.value.cloneNode(true));
+                    // 大集合也要让出事件循环，使超时和取消可以生效。
+                    if (++count % 100 === 0) await this.waitForDelay(0, signal);
+                }
+                return source;
+            };
+            try {
+                return await new Promise((resolve, reject) => {
+                    timeout = setTimeout(() => reject(new Error('BookJS: Timed out waiting for content')),
+                        Math.max(1, Number(this.config.resourceTimeout) || 10000));
+                    aborted = () => reject(new DOMException('Render cancelled', 'AbortError'));
+                    signal.addEventListener('abort', aborted, { once: true });
+                    collect().then(resolve, reject);
+                    if (signal.aborted) aborted();
+                });
+            } finally {
+                active = false;
+                clearTimeout(timeout);
+                signal.removeEventListener('abort', aborted);
+                if (iterator && !completed && typeof iterator.return === 'function') {
+                    // 异步生成器可能仍在等外部输入，不能等待 return() 才取消渲染。
+                    Promise.resolve().then(() => iterator.return()).catch(() => {});
+                }
             }
         }
 
@@ -1590,6 +1613,12 @@
 
         setupDOMObserver() {
             if (this._stopped || typeof MutationObserver === 'undefined') return;
+            if (this.getConfig().contentItemIterator != null) {
+                this._domObserver?.disconnect();
+                this._domObserver = null;
+                this._observedSource = null;
+                return;
+            }
             const source = this.getContentBox();
             if (this._domObserver && this._observedSource === source) return;
             this._domObserver?.disconnect();

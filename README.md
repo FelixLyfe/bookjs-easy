@@ -1,8 +1,8 @@
-# BookJS-Easy v2.1.1
+# BookJS-Easy v2.2.0
 
 ## 概述
 
-BookJS-Easy 是一个无需第三方运行时依赖的浏览器自动分页与打印预览工具，可通过浏览器打印生成 PDF。v2.1.1 修复纸张尺寸变更后的重新分页、跨页富文本格式丢失，以及内容更新和取消时的打印就绪状态。
+BookJS-Easy 是一个无需第三方运行时依赖的浏览器自动分页与打印预览工具，可通过浏览器打印生成 PDF。v2.2.0 增加集合与异步内容输入、元素底部预留空间、挂件应用范围，并统一页码范围中的数字字符串处理。
 
 ## 主要特性
 
@@ -23,6 +23,7 @@ BookJS-Easy 是一个无需第三方运行时依赖的浏览器自动分页与�
 - **调试模式**: 内置调试工具栏，支持快速跳转页面和打印预览。
 - **背景图片**: 支持页面级背景图片。
 - **自动监听**: 等待非空内容、图片和字体；监听内容节点、文本及属性变化，合并重复渲染请求。
+- **异步内容输入**: 支持 DOM 元素集合、生成器、异步生成器及 Promise，支持超时和取消。
 - **自定义纸张**: `pageSizeOption` 的尺寸同时用于预览和 PDF 打印。
 
 从 v2.0 升级时注意：`render()`、`forceRender()`、`BookJS.start()` 现在返回 Promise，读取分页结果或调用打印前应 `await`。无法容纳的固定高度元素、图片加载失败等会拒绝 Promise 并触发 `book.abort`，不会再把被裁切的结果标记为成功。
@@ -46,7 +47,7 @@ window.bookConfig = {
   // pageSizeOption: { width: '100mm', height: '140mm' }, // 优先于 pageSize
   contentBox: '#content-box', // 也可传入 DOM 元素
   observeContent: true, // 自动响应容器内部的 DOM、文本和属性变化
-  resourceTimeout: 10000, // 图片/字体等待超时，毫秒
+  resourceTimeout: 10000, // 内容收集、图片/字体等待各自的超时，毫秒
   printDelay: 0, // 完成事件后设置 PDFComplete 的延时，0 有效
   debug: false, // 开启调试模式（输出日志并在页面显示调试工具栏）
 
@@ -61,7 +62,7 @@ window.bookConfig = {
 };
 ```
 
-`simplePageNum` 也支持 `true` / `false`。编号范围采用 **从 1 开始的页号**。范围内的页面会连续编号，与是否存在页眉挂件无关。
+`simplePageNum` 也支持 `true` / `false`。编号范围采用 **从 1 开始的页号**。范围内的页面会连续编号，与是否存在页眉挂件无关。`pageBegin` / `pageEnd` 接受整数或整数字符串；`pageEnd: -1` / `"-1"` 表示直到末页，`0` / `"0"` 表示不编号。小数和无效值会拒绝渲染。
 
 ### 3. 编写 HTML 内容
 
@@ -121,6 +122,7 @@ window.bookConfig = {
 | `data-split-repeat="true"` | 表格单元格属性 | 用于 `td`。当该单元格因跨页被拆分时，在下一页的单元格中重复内容。 |
 | `data-split-strategy="precise"` | 表格容器属性 | 强制使用精确拆分策略，不尝试将整个行组移到下一页。 |
 | `data-pendant-key` / `data-pendant-name` | 挂件标识 | 替换当前页的同名挂件并向后续页面继承。空 `pendants` 容器清除挂件。 |
+| `data-op-param` | JSON 操作参数 | 支持内容的 `bottomOffset` 及挂件的 `overflow`、`applyCurrentPage`，见下例。 |
 
 补充说明:
 
@@ -130,6 +132,19 @@ window.bookConfig = {
 - 也可使用 `.nop-text-box`、`.nop-block-box`、`.nop-new-page` 三种 class 指定对应的分页类型。
 - 不可拆分的图片、固定高度元素或重复外壳必须能放入一页；否则会报告错误。源 DOM 保留，便于修正尺寸后重新渲染。
 - 普通挂件的 `${PAGE}` / `${TOTAL_PAGE}` 使用实际页号/页数；简易页码模板使用配置范围内的连续编号/页数。
+
+`bottomOffset` 指定开始放置元素所需的页尾剩余空间，适用于 `block`、`text`、三种盒子及 `table`。数字使用 px，也可写 `"20mm"` 等尺寸；剩余空间不足时先换页，空页不会因此重复换页。
+
+```html
+<p data-op-type="text" data-op-param='{"bottomOffset":80}'>本段至少需要 80px 页尾空间才开始排版。</p>
+
+<!-- 替换后续页的整组挂件，当前页保留已有挂件 -->
+<div data-op-type="pendants" data-op-param='{"overflow":true,"applyCurrentPage":false}'>
+  <div data-pendant-name="header">下一章节 - ${PAGE}</div>
+</div>
+```
+
+挂件默认立即应用到当前页并向后继承；未配置 `overflow` 或设为 `false` 时保留其他挂件、替换同名挂件，设为 `true` 时替换整组。空容器清除模板；配合 `applyCurrentPage: false` 可仅清除后续页挂件。空的装饰元素和直接放入的图片也会保留。`data-op-param` 必须是有效 JSON 对象。
 
 ## API 参考
 
@@ -145,6 +160,32 @@ window.bookConfig = {
 ### `window.BookJS.instance`
 获取当前运行的 BookJS 实例。
 
+### `contentItemIterator` 自定义内容输入
+
+配置此项后优先使用自定义输入，无需 `contentBox`。支持单个 DOM 元素、数组、Set、NodeList、HTMLCollection、同步/异步可迭代对象，以及返回这些内容的 Promise 或工厂函数。每个迭代项必须是 DOM 元素，内部克隆元素，保留输入 DOM。
+
+```javascript
+const book = BookJS.create({
+  contentItemIterator: async ({ signal }) => {
+    const response = await fetch('/print-data', { signal });
+    if (!response.ok) throw new Error('内容加载失败');
+    const rows = await response.json();
+    return rows.map(row => {
+      const p = document.createElement('p');
+      p.dataset.opType = 'text';
+      p.textContent = row.text;
+      return p;
+    });
+  },
+  resourceTimeout: 10000,
+});
+await book.render();
+```
+
+每次渲染都会重新调用工厂函数；需要重新读取数据时使用 `forceRender()`。已消费的生成器对象不能重放，建议传入生成器函数。输入收集完毕后才进行资源等待和分页，适合有限集合，不适合持续推送的无限流；不适配 jQuery Deferred 的 progress 通知。
+
+空集合会清除旧预览并保持未就绪，不会自动重复调用工厂。输入失败或超时会拒绝 Promise 并触发 `book.abort`；`cleanup()` 和强制重渲染会取消正在等待的输入，工厂可通过 `signal` 停止自己的请求。自定义输入不监听原始 DOM，修改后需显式重新渲染。
+
 ### `book.render(force = false)`
 返回 Promise；等待资源后完成分页。`force = true` 可强制重新渲染。源容器不存在或为空时继续等待；此时返回的 Promise 不代表已有分页结果，应使用 `book.after-complete` 或 `window.status` 判断就绪。
 
@@ -156,7 +197,7 @@ window.bookConfig = {
 
 ### 渲染事件与打印就绪
 
-原生 `document` 事件顺序为 `book.before-render` → `book.before-complete` → `book.after-complete`。后两个事件触发时 `isRendered` 已为 `true`；`event.detail` 含 `PAGE_BEGIN_INDEX`、`PAGE_END_INDEX`、`TOTAL_PAGE`，表示实际页面范围。在 `book.before-complete` 中调用 `cleanup()` 可取消后续完成事件；取消时 Promise 以 `AbortError` 拒绝。渲染失败触发 `book.abort`，`event.detail.error` 为错误对象，也可使用 `errorCallback(error)`。
+成功渲染的原生 `document` 事件顺序为 `book.before-render` → `book.before-complete` → `book.after-complete`。使用自定义输入时，收集完毕后才触发 `book.before-render`。后两个事件触发时 `isRendered` 已为 `true`；`event.detail` 含 `PAGE_BEGIN_INDEX`、`PAGE_END_INDEX`、`TOTAL_PAGE`，表示实际页面范围。在 `book.before-complete` 中调用 `cleanup()` 可取消后续完成事件；取消时 Promise 以 `AbortError` 拒绝。渲染失败触发 `book.abort`，`event.detail.error` 为错误对象，也可使用 `errorCallback(error)`。
 
 成功后经过 `printDelay` 将 `window.status` 设为 `PDFComplete`；失败、内容为空或重新渲染时清除此状态。
 
@@ -207,6 +248,6 @@ npm run check
 npm test
 ```
 
-可用 `BOOKJS_CHROME` 指定浏览器可执行文件。30 个回归样例使用真实浏览器布局，覆盖文本及格式完整性、盒子、表格、异步资源、纸张重排和失败/取消路径。
+可用 `BOOKJS_CHROME` 指定浏览器可执行文件。44 个回归样例使用真实浏览器布局，覆盖文本及格式完整性、盒子、表格、异步输入与资源、挂件范围、纸张重排和失败/取消路径。
 
 目前自动化回归已在 Chrome 中验证。

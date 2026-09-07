@@ -14,6 +14,8 @@ before(async () => {
 });
 after(async () => { await browser?.close(); });
 
+const compactConfig = { pageSizeOption: { width: '240px', height: '200px' }, padding: '20px' };
+
 async function fixture(t, content, config = {}, css = '') {
     const context = await browser.newContext();
     t.after(() => context.close());
@@ -451,4 +453,204 @@ test('cancelling from before-complete cannot emit after-complete', async t => {
     assert.equal(await page.evaluate(() => events.filter(event => event.name === 'book.after-complete').length), 0);
     assert.notEqual(await page.evaluate(() => window.status), 'PDFComplete');
     assert.equal(await page.locator('.nop-book, .nop-measure-box').count(), 0);
+});
+
+test('operation bottomOffset moves a short block before it reaches the reserved page tail', async t => {
+    const { page } = await fixture(t, `<div style="height:120px">first</div><p data-op-type="text" data-op-param='{"bottomOffset":70}'>reserved tail</p>`, compactConfig);
+    await render(page);
+    assert.equal(await page.locator('.nop-page-item').count(), 2);
+    assert.equal(await page.locator('.nop-page-item').nth(1).locator('p').textContent(), 'reserved tail');
+    await assertFits(page);
+});
+
+test('pendants can replace future templates without changing the current page', async t => {
+    const { page } = await fixture(t, `
+        <div data-op-type="pendants"><div data-pendant-name="old">OLD</div></div><p>first</p>
+        <div data-op-type="pendants" data-op-param='{"overflow":true,"applyCurrentPage":false}'><div data-pendant-name="new">NEW</div></div>
+        <div data-op-type="new-page"></div><p>second</p>
+        <div data-op-type="pendants" data-op-param='{"overflow":false}'><div data-pendant-name="extra">EXTRA</div></div>
+        <div data-op-type="new-page"></div><p>third</p>`, compactConfig);
+    await render(page);
+    const templates = await page.locator('.nop-page-item').evaluateAll(pages => pages.map(page => [...page.querySelectorAll('.nop-page-pendants')].map(node => node.textContent)));
+    assert.deepEqual(templates, [['OLD'], ['NEW', 'EXTRA'], ['NEW', 'EXTRA']]);
+});
+
+test('empty future pendants clear inheritance and preserve the current header', async t => {
+    const { page } = await fixture(t, `<div data-op-type="pendants"><div>HEADER</div></div><p>first</p>
+        <div data-op-type="pendants" data-op-param='{"applyCurrentPage":false}'></div>
+        <div data-op-type="new-page"></div><p>second</p>`, compactConfig);
+    await render(page);
+    assert.equal(await page.locator('.nop-page-item').first().locator('.nop-page-pendants').count(), 1);
+    assert.equal(await page.locator('.nop-page-item').nth(1).locator('.nop-page-pendants').count(), 0);
+});
+
+test('page ranges accept numeric strings and keep the documented one-based numbering', async t => {
+    const { page } = await fixture(t, '<p>one</p><div data-op-type="new-page"></div><p>two</p><div data-op-type="new-page"></div><p>three</p>',
+        { ...compactConfig, simplePageNum: { pageBegin: '2', pageEnd: '-1' } });
+    await render(page);
+    assert.deepEqual(await page.locator('.pendant-pageNumSimple').allTextContents(), ['1 / 2', '2 / 2']);
+    for (const pageEnd of [0, '0']) {
+        await page.evaluate(async pageEnd => { bookConfig.simplePageNum.pageEnd = pageEnd; await BookJS.instance.forceRender(); }, pageEnd);
+        assert.equal(await page.locator('.pendant-pageNumSimple').count(), 0);
+    }
+});
+
+test('invalid page ranges reject cleanly instead of indexing a fractional page', async t => {
+    const { page } = await fixture(t, '<p>one</p>', { ...compactConfig, simplePageNum: { pageBegin: 1.5 } });
+    const message = await page.evaluate(async () => {
+        try { await BookJS.instance.render(); } catch (error) { return error.message; }
+    });
+    assert.match(message, /pageBegin.*integer/);
+    assert.notEqual(await page.evaluate(() => window.status), 'PDFComplete');
+});
+
+test('element collections and generator factories render in input order without a source container', async t => {
+    const { page } = await fixture(t, '<p>unused</p>', compactConfig);
+    const results = await page.evaluate(async () => {
+        const box = document.getElementById('content-box');
+        box.remove();
+        const a = document.createElement('p'); a.textContent = 'A';
+        const b = document.createElement('p'); b.textContent = 'B';
+        box.replaceChildren(a, b);
+        const inputs = [[a, b], new Set([a, b]), box.children, box.querySelectorAll('p'), function* () { yield a; yield b; }];
+        const results = [];
+        for (const contentItemIterator of inputs) {
+            bookConfig.contentItemIterator = contentItemIterator;
+            await BookJS.instance.forceRender();
+            results.push({ text: document.querySelector('.nop-book')?.textContent, ready: window.status, sourceIntact: box.textContent });
+        }
+        return results;
+    });
+    assert.deepEqual(results, Array(5).fill({ text: 'AB', ready: 'PDFComplete', sourceIntact: 'AB' }));
+});
+
+test('async content waits for all items and their images before completing', async t => {
+    const { page } = await fixture(t, '', compactConfig);
+    let releaseImage;
+    const imageReady = new Promise(resolve => { releaseImage = resolve; });
+    await page.route('https://assets.test/input.svg', async route => {
+        await imageReady;
+        await route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12"></svg>' });
+    });
+    await page.evaluate(() => {
+        bookConfig.contentItemIterator = async function* () {
+            const first = document.createElement('p'); first.textContent = 'ASYNC'; yield first;
+            await new Promise(resolve => { window.releaseInput = resolve; });
+            const img = document.createElement('img'); img.src = 'https://assets.test/input.svg'; yield img;
+        };
+        window.pendingInput = BookJS.instance.render();
+    });
+    await page.waitForFunction(() => !!window.releaseInput);
+    assert.equal(await page.evaluate(() => events.some(e => e.name === 'book.after-complete')), false);
+    await page.evaluate(() => releaseInput());
+    await page.waitForFunction(() => !!document.querySelector('.nop-measure-box img'));
+    assert.notEqual(await page.evaluate(() => window.status), 'PDFComplete');
+    releaseImage();
+    await page.evaluate(() => pendingInput);
+    assert.equal(await page.locator('.nop-book p').textContent(), 'ASYNC');
+    assert.equal(await page.locator('.nop-book img').count(), 1);
+    assert.equal(await page.evaluate(() => events.filter(e => e.name === 'book.after-complete').length), 1);
+    await assertFits(page);
+});
+
+test('pending input can be superseded and a late rejection cannot invalidate its replacement', async t => {
+    const { page } = await fixture(t, '', compactConfig);
+    await page.evaluate(() => {
+        bookConfig.contentItemIterator = () => new Promise((resolve, reject) => { window.rejectInput = reject; });
+        window.pendingInput = BookJS.instance.render();
+    });
+    await page.waitForFunction(() => !!window.rejectInput);
+    await page.evaluate(async () => {
+        const node = document.createElement('p'); node.textContent = 'replacement';
+        bookConfig.contentItemIterator = Promise.resolve([node]);
+        await BookJS.instance.forceRender();
+        await pendingInput;
+        rejectInput(new Error('stale input'));
+    });
+    assert.equal(await page.locator('.nop-book p').textContent(), 'replacement');
+    assert.equal(await page.evaluate(() => window.status), 'PDFComplete');
+    assert.equal(await page.evaluate(() => events.filter(e => e.name === 'book.abort').length), 0);
+});
+
+test('input timeout and explicit rejection fail without publishing completion', async t => {
+    const { page } = await fixture(t, '', { ...compactConfig, resourceTimeout: 80 });
+    const messages = await page.evaluate(async () => {
+        const messages = [];
+        for (const input of [() => new Promise(() => {}), () => Promise.reject(new Error('input failed'))]) {
+            bookConfig.contentItemIterator = input;
+            try { await BookJS.instance.forceRender(); } catch (error) { messages.push(error.message); }
+        }
+        return messages;
+    });
+    assert.match(messages[0], /Timed out waiting for content/);
+    assert.equal(messages[1], 'input failed');
+    assert.equal(await page.locator('.nop-book, .nop-measure-box').count(), 0);
+    assert.notEqual(await page.evaluate(() => window.status), 'PDFComplete');
+});
+
+test('cleanup cancels an input factory through its AbortSignal', async t => {
+    const { page } = await fixture(t, '', compactConfig);
+    await page.evaluate(() => {
+        bookConfig.contentItemIterator = ({ signal }) => { window.inputSignal = signal; return new Promise(() => {}); };
+        window.inputResult = BookJS.instance.render().catch(error => error.name);
+    });
+    await page.waitForFunction(() => !!window.inputSignal);
+    assert.equal(await page.evaluate(async () => { BookJS.instance.cleanup(); return await inputResult; }), 'AbortError');
+    assert.equal(await page.evaluate(() => inputSignal.aborted), true);
+    assert.equal(await page.locator('.nop-book, .nop-measure-box').count(), 0);
+});
+
+test('unnamed and decorative pendants inherit once per page and keep CSS positioning', async t => {
+    const { page } = await fixture(t, `<div data-op-type="pendants"><div>HEADER</div><i class="decoration"></i></div>
+        ${Array.from({ length: 4 }, (_, i) => `${i ? '<div data-op-type="new-page"></div>' : ''}<p>page ${i}</p>`).join('')}`,
+        compactConfig, '.nop-book .decoration { position: relative; display:block; height:4px; background:red }');
+    await render(page);
+    assert.deepEqual(await page.locator('.nop-page-item').evaluateAll(pages => pages.map(page => page.querySelectorAll('.nop-page-pendants').length)), [2, 2, 2, 2]);
+    assert.deepEqual(await page.locator('.decoration.nop-page-pendants').evaluateAll(nodes => nodes.map(n => getComputedStyle(n).position)), Array(4).fill('relative'));
+});
+
+test('operation parameters reject malformed objects and do not add empty pages for oversized offsets', async t => {
+    const { page } = await fixture(t, `<p data-op-param='{"bottomOffset":"1000px"}'>content</p>`, compactConfig);
+    await render(page);
+    assert.equal(await page.locator('.nop-page-item').count(), 1);
+    for (const value of ['null', '[]', '{"bottomOffset":-1}', '{']) {
+        const result = await page.evaluate(async value => {
+            document.querySelector('#content-box p').setAttribute('data-op-param', value);
+            try { await BookJS.instance.forceRender(); return 'success'; } catch { return 'rejected'; }
+        }, value);
+        assert.equal(result, 'rejected');
+        assert.notEqual(await page.evaluate(() => window.status), 'PDFComplete');
+    }
+});
+
+test('empty and invalid custom input cannot retain an old preview or print readiness', async t => {
+    const { page } = await fixture(t, '<p>old</p>', compactConfig);
+    await render(page);
+    const results = await page.evaluate(async () => {
+        const results = [];
+        for (const input of [[], [document.createTextNode('invalid')], 'invalid']) {
+            bookConfig.contentItemIterator = input;
+            let error = false;
+            try { await BookJS.instance.forceRender(); } catch { error = true; }
+            results.push({ error, ready: BookJS.instance.isRendered, status: window.status, books: document.querySelectorAll('.nop-book').length });
+        }
+        return results;
+    });
+    assert.deepEqual(results, [false, true, true].map(error => ({ error, ready: false, status: '', books: 0 })));
+});
+
+test('generator factories produce fresh snapshots and run cleanup after invalid items', async t => {
+    const { page } = await fixture(t, '', compactConfig);
+    const result = await page.evaluate(async () => {
+        let count = 0;
+        bookConfig.contentItemIterator = function* () { yield Object.assign(document.createElement('p'), { textContent: String(++count) }); };
+        await BookJS.instance.render();
+        await BookJS.instance.forceRender();
+        const text = document.querySelector('.nop-book p').textContent;
+        let closed = false;
+        bookConfig.contentItemIterator = function* () { try { yield 'invalid'; } finally { closed = true; } };
+        try { await BookJS.instance.forceRender(); } catch {}
+        return { text, closed };
+    });
+    assert.deepEqual(result, { text: '2', closed: true });
 });

@@ -1,6 +1,6 @@
 /*!
  * BookJS-Easy - WEB Print Auto Pagination / Preview / Make PDF
- * Version: 2.2.0
+ * Version: 2.3.0
  * Author: Felix Lyu
  * License: MIT
  */
@@ -26,6 +26,8 @@
         observeContent: true,
         resourceTimeout: 10000,
         printDelay: 0,
+        simpleCatalog: false,
+        textNoBreakChars: ['，', '。', '：', '”', '！', '？', '、', '；', '》', ')', '）', '】', '…', '.', ',', '!', ']', '}', '｝'],
         simplePageNum: {
             enable: true,
             pageBegin: 1,
@@ -473,10 +475,14 @@
                     font-size: 12px;
                     color: #666;
                 }
-                
-                
 
-                
+                .nop-book .catalog-title { font-size: 20px; line-height: 32px; margin-bottom: 12px; }
+                .nop-book .catalog-level { display: flex; align-items: baseline; gap: 8px; line-height: 24px; }
+                .nop-book .catalog-item-title { min-width: 0; overflow-wrap: anywhere; }
+                .nop-book .catalog-item-line { flex: 1; border-bottom: 1px dotted; min-width: 12px; }
+                .nop-book .catalog-item-pagenum { flex-shrink: 0; }
+                .nop-book .catalog-level a { color: inherit; text-decoration: none; }
+
                 /* 打印媒体查询 */
                 @media print {
                     .nop-book {
@@ -519,7 +525,9 @@
             Array.from(contentBox.children).forEach(child => {
                 this.processElement(child);
             });
+        }
 
+        finalize() {
             // 全部分页完成后，回填挂件中的总页数占位符
             this.finalizePendantPlaceholders();
 
@@ -754,12 +762,16 @@
             const fragmenter = {
                 source,
                 points: this.getBreakPoints(source, mode),
-                make: (from, to) => {
+                range: (from, to) => {
                     const range = document.createRange();
                     const start = fragmenter.points[from];
                     const end = fragmenter.points[to];
                     range.setStart(start.node, start.offset);
                     range.setEnd(end.node, end.offset);
+                    return range;
+                },
+                make: (from, to) => {
+                    const range = fragmenter.range(from, to);
                     const clone = template.cloneNode(true);
                     const fill = (fillSelector && clone.querySelector(fillSelector)) || clone;
                     let contents = range.cloneContents();
@@ -807,7 +819,17 @@
                 // 前导空白不算一个可独立分页的词；超长单词/数字仍必须向前推进。
                 if (!range.toString().trim()) return low;
             }
-            return boundary > start ? boundary : low;
+            boundary = boundary > start ? boundary : low;
+            // 跨内联标签读取下一个字素，把闭合标点前的字符一起留到续页。
+            const noBreak = this._noBreakChars || (this._noBreakChars = new Set(this.config.textNoBreakChars));
+            const wordBoundary = boundary;
+            while (boundary > start && boundary < fragmenter.points.length - 1 &&
+                noBreak.has(fragmenter.range(boundary, boundary + 1).toString().trimStart()[0])) boundary--;
+            if (boundary === wordBoundary) return boundary;
+            if (boundary > start && fragmenter.range(start, boundary).toString().trim() &&
+                fits(fragmenter.make(start, boundary))) return boundary;
+            // 标点串或极窄纸张仍须前进，不能只输出空白或无限创建空页。
+            return wordBoundary;
         }
 
         refineBreakPoint(fragmenter, start) {
@@ -821,6 +843,7 @@
         }
 
         fragmentElement(element, mode = 'text', fillSelector) {
+            if (mode !== 'text' && this.fragmentBoxAtPageBreaks(element, mode, fillSelector)) return;
             const fragmenter = this.createFragmenter(element, mode, fillSelector);
             let start = 0;
             if (fragmenter.points.length === 1) {
@@ -848,6 +871,26 @@
                 start = end;
                 if (start < fragmenter.points.length - 1) this.pageManager.createNewPage();
             }
+        }
+
+        fragmentBoxAtPageBreaks(element, mode, fillSelector) {
+            const target = (fillSelector && element.querySelector(fillSelector)) || element;
+            const isBreak = node => node.nodeType === Node.ELEMENT_NODE && this.getElementOpType(node) === 'new-page';
+            if (!Array.from(target.children).some(isBreak)) return false;
+            const sections = [[]];
+            for (const node of target.childNodes) {
+                if (isBreak(node)) sections.push([]);
+                else sections[sections.length - 1].push(node);
+            }
+            sections.forEach((nodes, index) => {
+                if (!nodes.some(node => node.nodeType === Node.ELEMENT_NODE || node.textContent.trim())) return;
+                if (index > 0) this.processNewPage();
+                const clone = element.cloneNode(true);
+                const fill = (fillSelector && clone.querySelector(fillSelector)) || clone;
+                fill.replaceChildren(...nodes.map(node => node.cloneNode(true)));
+                this.fragmentElement(clone, mode, fillSelector);
+            });
+            return true;
         }
 
 
@@ -1258,16 +1301,135 @@
             this._measureBox = null;
         }
 
+        prepareContent(source) {
+            const option = this.config.simpleCatalog;
+            if (!option || option.showCatalog === false) return source;
+            if (option !== true && !Utils.isPlainObject(option)) throw new TypeError('BookJS: simpleCatalog must be a boolean or object');
+            this.catalogConfig = Utils.mergeConfig({
+                titlesSelector: 'h1,h2,h3,h4,h5,h6',
+                header: '<div class="catalog-title">目录</div>'
+            }, option === true ? {} : option);
+            // 在独立快照中标记标题，跨页后仍能去重并取回完整标题，不改动源 DOM。
+            const snapshot = source.cloneNode(true);
+            this.catalogTitles = Array.from(snapshot.querySelectorAll(this.catalogConfig.titlesSelector), (element, index) => {
+                element.setAttribute('data-bookjs-catalog-key', index);
+                return { title: element.textContent.trim(), level: /^H[1-6]$/.test(element.tagName) ? Number(element.tagName[1]) : 1 };
+            });
+            return snapshot;
+        }
+
+        getPageNumbering() {
+            const pages = this.pageManager.pages.filter(page => !page.isCatalog);
+            const config = this.config.simplePageNum;
+            if (!config || !config.enable) return { pages, startPage: 0, lastIndex: -1, totalNumberedPages: 0 };
+            for (const key of ['pageBegin', 'pageEnd']) {
+                const value = config[key];
+                const number = typeof value === 'string' && /^-?\d+$/.test(value.trim()) ? Number(value) : value;
+                if (!Number.isSafeInteger(number)) throw new TypeError(`BookJS: ${key} must be an integer`);
+                config[key] = number;
+            }
+            const startPage = Math.max(0, config.pageBegin - 1);
+            const lastIndex = Math.min(config.pageEnd === -1 ? pages.length - 1 : config.pageEnd - 1, pages.length - 1);
+            return { pages, startPage, lastIndex, totalNumberedPages: Math.max(0, lastIndex - startPage + 1) };
+        }
+
+        createCatalogContent() {
+            if (!this.catalogConfig) return null;
+            const source = document.createElement('div');
+            const { pages, startPage, lastIndex } = this.getPageNumbering();
+            const numbered = !!this.config.simplePageNum?.enable;
+            const seen = new Set();
+            pages.forEach((page, index) => {
+                for (const element of page.content.querySelectorAll('[data-bookjs-catalog-key]')) {
+                    const key = Number(element.getAttribute('data-bookjs-catalog-key'));
+                    if (seen.has(key) || !this.catalogTitles[key]) continue;
+                    seen.add(key);
+                    if (numbered && (index < startPage || index > lastIndex)) continue;
+                    let linkId = `bookjs-catalog-target-${key}`;
+                    while (document.getElementById(linkId)) linkId += '-';
+                    const info = { ...this.catalogTitles[key], pageNum: numbered ? index - startPage + 1 : index + 1, linkId };
+                    let item;
+                    if (typeof this.catalogConfig.makeItem === 'function') {
+                        const result = this.catalogConfig.makeItem(element, info, this.catalogConfig);
+                        if (result === false || result == null || result === '') continue;
+                        if (typeof result !== 'string' && result?.nodeType !== Node.ELEMENT_NODE) {
+                            throw new TypeError('BookJS: Catalog makeItem must return HTML, an Element or false');
+                        }
+                        item = document.createElement('div');
+                        if (typeof result === 'string') item.innerHTML = result;
+                        else item.appendChild(result.cloneNode(true));
+                    } else {
+                        item = document.createElement('div');
+                        item.className = `catalog-level catalog-level-${info.level}`;
+                        item.style.paddingLeft = `${(info.level - 1) * 12}px`;
+                        const title = document.createElement('span');
+                        title.className = 'catalog-item-title';
+                        const link = document.createElement('a');
+                        link.setAttribute('href', '#' + info.linkId);
+                        link.textContent = info.title;
+                        title.appendChild(link);
+                        const line = document.createElement('span');
+                        line.className = 'catalog-item-line';
+                        const number = document.createElement('span');
+                        number.className = 'catalog-item-pagenum';
+                        number.textContent = info.pageNum;
+                        item.append(title, line, number);
+                    }
+                    // 独立零尺寸锚点避开隐藏源 DOM 的同名 id，保留标题原来的 id 样式。
+                    const anchor = document.createElement('span');
+                    anchor.id = info.linkId;
+                    anchor.style.cssText = 'position:absolute;width:0;height:0;overflow:hidden;';
+                    element.prepend(anchor);
+                    source.appendChild(item);
+                }
+            });
+            if (!source.children.length) return null;
+            if (this.catalogConfig.header) {
+                const header = document.createElement('div');
+                header.innerHTML = this.catalogConfig.header;
+                source.prepend(header);
+            }
+            return source;
+        }
+
+        insertCatalog(source) {
+            const manager = this.pageManager;
+            const bodyPages = manager.pages.slice();
+            const templates = manager.pendantTemplates;
+            manager.pendantTemplates = [];
+            manager.currentPage = null;
+            try {
+                this.processContent(source);
+            } finally {
+                manager.pendantTemplates = templates;
+            }
+            const catalogPages = manager.pages.slice(bodyPages.length);
+            catalogPages.forEach(page => {
+                page.isCatalog = true;
+                page.element.classList.add('nop-page-item-catalog');
+            });
+            manager.pages = [...catalogPages, ...bodyPages];
+            manager.pages.forEach((page, index) => {
+                for (const name of [...page.element.classList]) {
+                    if (/^nop-page-item-pagenum-\d+$/.test(name)) page.element.classList.remove(name);
+                }
+                page.element.classList.add(`nop-page-item-pagenum-${index}`);
+                page.element.classList.toggle('nop-page-item-odd', index % 2 === 0);
+                page.element.classList.toggle('nop-page-item-even', index % 2 !== 0);
+                manager.bookContainer.appendChild(page.element);
+            });
+            manager.currentPage = manager.pages[manager.pages.length - 1];
+        }
+
         // 分页结束后统一替换用户挂件中的 ${TOTAL_PAGE}，避免使用创建页面时的临时页数
         finalizePendantPlaceholders() {
             const totalPages = this.pageManager.pages.length;
-            this.pageManager.pages.forEach(page => {
-                const pendants = page.element.querySelectorAll('.nop-page-pendants:not(.pendant-pageNumSimple)');
-                pendants.forEach(pendant => {
-                    if (pendant.innerHTML.indexOf('${TOTAL_PAGE}') !== -1) {
-                        pendant.innerHTML = pendant.innerHTML.replace(/\$\{TOTAL_PAGE\}/g, totalPages);
-                    }
-                });
+            this.pageManager.pages.forEach((page, index) => {
+                for (const template of page.pendants) {
+                    const pendant = page.element.querySelector('.' + template.pendantId);
+                    if (pendant && /\$\{(?:PAGE|TOTAL_PAGE)\}/.test(template.element.innerHTML)) pendant.innerHTML = template.element.innerHTML
+                        .replace(/\$\{PAGE\}/g, index + 1).replace(/\$\{TOTAL_PAGE\}/g, totalPages);
+                }
             });
         }
 
@@ -1279,22 +1441,10 @@
                 return;
             }
 
-            for (const key of ['pageBegin', 'pageEnd']) {
-                const value = config[key];
-                const number = typeof value === 'string' && /^-?\d+$/.test(value.trim()) ? Number(value) : value;
-                if (!Number.isSafeInteger(number)) throw new TypeError(`BookJS: ${key} must be an integer`);
-                config[key] = number;
-            }
-
-            this.log('页面数量:', this.pageManager.pages.length);
-            const startPage = Math.max(0, typeof config.pageBegin === 'number' ? config.pageBegin - 1 : 0);
-            const endPage = config.pageEnd === -1 ? this.pageManager.pages.length - 1 : config.pageEnd - 1;
-            const lastIndex = Math.min(endPage, this.pageManager.pages.length - 1);
-
-            const totalNumberedPages = Math.max(0, lastIndex - startPage + 1);
+            const { pages, startPage, lastIndex, totalNumberedPages } = this.getPageNumbering();
             let pageNumCounter = 1;
             for (let i = startPage; i <= lastIndex; i++) {
-                const page = this.pageManager.pages[i];
+                const page = pages[i];
 
                 // 清除已存在的页脚
                 const existingFooters = page.element.querySelectorAll('.pendant-pageNumSimple');
@@ -1467,7 +1617,15 @@
                 if (signal.aborted) throw new DOMException('Render cancelled', 'AbortError');
                 // 内容或配置已变化时，下一轮重新等待最新资源，旧快照不能宣布完成。
                 if (this._rerenderRequested) return this;
-                this.contentProcessor.processContent(source);
+                this.contentProcessor.processContent(this.contentProcessor.prepareContent(source));
+                const catalog = this.contentProcessor.createCatalogContent();
+                if (catalog) {
+                    await this.waitForResources(catalog, signal);
+                    if (signal.aborted) throw new DOMException('Render cancelled', 'AbortError');
+                    if (this._rerenderRequested) return this;
+                    this.contentProcessor.insertCatalog(catalog);
+                }
+                this.contentProcessor.finalize();
                 this.contentProcessor.cleanup();
                 this.isRendered = true;
                 this._requestedStart = false;

@@ -1,13 +1,14 @@
 {
   "name": "bookjs-easy",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Dependency-free browser pagination and print preview",
   "main": "bookjs-easy.js",
   "license": "MIT",
   "files": ["bookjs-easy.js", "README.md"],
   "scripts": {
     "test": "node --test tests/pagination.test.cjs",
-    "check": "node --check bookjs-easy.js"
+    "check": "node --check bookjs-easy.js",
+    "compare:legacy": "node tests/compare-legacy.cjs"
   },
   "devDependencies": {
     "playwright": "1.62.1"

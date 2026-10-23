@@ -16,6 +16,8 @@ after(async () => { await browser?.close(); });
 
 const compactConfig = { pageSizeOption: { width: '240px', height: '200px' }, padding: '20px' };
 
+const catalogCSS = 'h1,h2{margin:0;font-size:16px;line-height:24px}';
+
 async function fixture(t, content, config = {}, css = '') {
     const context = await browser.newContext();
     t.after(() => context.close());
@@ -653,4 +655,164 @@ test('generator factories produce fresh snapshots and run cleanup after invalid 
         return { text, closed };
     });
     assert.deepEqual(result, { text: '2', closed: true });
+});
+
+for (const type of ['block-box', 'mix-box']) {
+    test(`${type} honors explicit breaks inside its fill area and retains its shell`, async t => {
+        const { page } = await fixture(t, `<section data-op-type="${type}" class="shell"><header>外壳</header><div class="nop-fill-box">
+            <div data-op-type="new-page"></div><p>第一页</p><div data-op-type="new-page"></div>
+            <div data-op-type="new-page"></div><p>第二页</p><div class="nop-new-page"></div>
+        </div></section>`, compactConfig);
+        await render(page);
+        assert.deepEqual(await page.locator('.nop-book .nop-fill-box').allTextContents().then(items => items.map(text => text.trim())), ['第一页', '第二页']);
+        assert.equal(await page.locator('.nop-page-item').count(), 2);
+        assert.equal(await page.locator('.nop-book .shell > header').count(), 2);
+        assert.equal(await page.locator('.nop-book [data-op-type="new-page"], .nop-book .nop-new-page').count(), 0);
+        assert.equal(await page.locator('#content-box [data-op-type="new-page"]').count(), 3);
+        await assertFits(page);
+    });
+}
+
+test('text boundaries avoid leading closing punctuation across inline tags', async t => {
+    const { page } = await fixture(t, '<p data-op-type="text" class="punctuation"><span>甲乙丙丁戊己庚辛</span><b>，壬癸子丑寅卯辰</b>。甲乙丙丁戊己庚辛，壬癸子丑寅卯辰。</p>', {
+        pageSizeOption: { width: '84px', height: '70px' }, padding: '10px'
+    }, '.punctuation{font:16px/24px monospace;line-break:anywhere}.punctuation b{font-weight:normal}');
+    const expected = await page.locator('#content-box p').textContent();
+    await render(page);
+    const texts = await page.locator('.nop-book p').allTextContents();
+    assert.equal(texts.join(''), expected);
+    assert.ok(texts.length > 1);
+    assert.ok(texts.every(text => !/^[，。]/.test(text)), JSON.stringify(texts));
+    await assertFits(page);
+});
+
+test('punctuation-only input and overlong words still make progress on narrow pages', async t => {
+    const text = '，，，，，，' + 'longword'.repeat(20);
+    const { page } = await fixture(t, `<p data-op-type="text">${text}</p>`, {
+        pageSizeOption: { width: '50px', height: '40px' }, padding: '10px'
+    }, 'p{line-break:anywhere}');
+    await render(page);
+    assert.equal((await page.locator('.nop-book p').allTextContents()).join(''), text);
+    await assertFits(page);
+});
+
+test('catalog pages link to body pages without shifting their displayed numbers', async t => {
+    const { page, errors } = await fixture(t, `<div data-op-type="pendants"><div>物理页 \${PAGE}/\${TOTAL_PAGE}</div></div>
+        <h1 id="chapter">第一章 &lt;安全&gt;</h1><p>正文一</p><div data-op-type="new-page"></div><h2>第二节</h2><p>正文二</p>`, {
+        ...compactConfig, simplePageNum: true, simpleCatalog: true
+    }, catalogCSS);
+    const source = await page.locator('#content-box').innerHTML();
+    await render(page);
+    assert.equal(await page.locator('.nop-page-item-catalog').count(), 1);
+    assert.equal(await page.locator('.nop-page-item').count(), 3);
+    assert.deepEqual(await page.locator('.catalog-item-pagenum').allTextContents(), ['1', '2']);
+    assert.deepEqual((await page.locator('.pendant-pageNumSimple').allTextContents()).map(text => text.trim()), ['1 / 2', '2 / 2']);
+    assert.deepEqual(await page.locator('.nop-page-pendants:not(.pendant-pageNumSimple)').allTextContents(), ['物理页 2/3', '物理页 3/3']);
+    const targets = await page.locator('.catalog-item-title a').evaluateAll(links => links.map(link => {
+        const target = document.getElementById(decodeURIComponent(link.hash.slice(1)));
+        return { title: link.textContent, page: target.closest('.nop-page-item').querySelector('.pendant-pageNumSimple').textContent.trim() };
+    }));
+    assert.deepEqual(targets, [{ title: '第一章 <安全>', page: '1 / 2' }, { title: '第二节', page: '2 / 2' }]);
+    assert.equal(await page.locator('#content-box').innerHTML(), source);
+    assert.equal(await page.evaluate(() => events.at(-1).info.TOTAL_PAGE), 3);
+    await assertFits(page);
+    const pdf = await page.pdf({ preferCSSPageSize: true });
+    assert.equal((pdf.toString('latin1').match(/\/Type \/Page\b/g) || []).length, 3, 'the PDF includes one catalog and two body pages');
+    await page.evaluate(() => BookJS.instance.forceRender());
+    assert.equal(await page.locator('.nop-page-item-catalog').count(), 1);
+    assert.equal(await page.locator('.catalog-item-title a').count(), 2);
+    assert.deepEqual(errors, []);
+});
+
+test('long catalogs paginate and respect the body numbering range', async t => {
+    const chapters = Array.from({ length: 16 }, (_, i) => `${i ? '<div data-op-type="new-page"></div>' : ''}<h1>章节 ${i + 1}</h1><p>正文</p>`).join('');
+    const { page } = await fixture(t, chapters, {
+        ...compactConfig, simplePageNum: { pageBegin: 2, pageEnd: 15 }, simpleCatalog: { header: '<div>章节目录</div>' }
+    }, catalogCSS);
+    await render(page);
+    assert.ok(await page.locator('.nop-page-item-catalog').count() > 1);
+    assert.deepEqual(await page.locator('.catalog-item-pagenum').allTextContents(), Array.from({ length: 14 }, (_, i) => String(i + 1)));
+    assert.deepEqual(await page.locator('.catalog-item-title').allTextContents(), Array.from({ length: 14 }, (_, i) => `章节 ${i + 2}`));
+    assert.equal(await page.locator('.nop-page-item:not(.nop-page-item-catalog)').count(), 16);
+    assert.equal(await page.locator('.nop-page-item-catalog .pendant-pageNumSimple').count(), 0);
+    await assertFits(page);
+});
+
+test('catalog callbacks receive native elements and full titles even when a heading splits', async t => {
+    const title = '长标题'.repeat(40);
+    const { page } = await fixture(t, `<h1 data-op-type="text">${title}</h1><p>正文</p>`, {
+        ...compactConfig, simpleCatalog: true
+    }, catalogCSS);
+    await page.evaluate(() => {
+        bookConfig.simpleCatalog = {
+            header: '',
+            makeItem(element, info) {
+                window.catalogCall = { tag: element.tagName, ...info };
+                return `<a class="custom-item" href="#${info.linkId}">完整章节 / ${info.pageNum}</a>`;
+            }
+        };
+    });
+    await render(page);
+    assert.deepEqual(await page.evaluate(() => ({ tag: catalogCall.tag, title: catalogCall.title, level: catalogCall.level, pageNum: catalogCall.pageNum })), {
+        tag: 'H1', title, level: 1, pageNum: 1
+    });
+    assert.equal(await page.locator('.custom-item').count(), 1);
+    assert.equal((await page.locator('.nop-book h1').allTextContents()).join(''), title);
+    await assertFits(page);
+});
+
+test('no selected headings, a disabled catalog or filtered items do not create empty catalog pages', async t => {
+    const { page } = await fixture(t, '<h1>标题</h1><p>正文</p>', { ...compactConfig, simpleCatalog: { titlesSelector: 'h2' } }, catalogCSS);
+    for (const mode of ['no-headings', 'disabled', 'filtered']) {
+        await page.evaluate(mode => {
+            if (mode === 'disabled') bookConfig.simpleCatalog = { showCatalog: false };
+            if (mode === 'filtered') bookConfig.simpleCatalog = { makeItem: () => false };
+            return BookJS.instance.forceRender();
+        }, mode);
+        assert.equal(await page.locator('.nop-page-item').count(), 1);
+        assert.equal(await page.locator('.nop-page-item-catalog').count(), 0);
+    }
+});
+
+test('catalog template images finish loading before completion and can be superseded', async t => {
+    const { page, errors } = await fixture(t, '<h1>旧标题</h1><p>正文</p>', {
+        ...compactConfig, simpleCatalog: { header: '<img src="https://assets.test/catalog.svg">' }
+    }, catalogCSS);
+    let release;
+    const held = new Promise(resolve => { release = resolve; });
+    t.after(release);
+    await page.route('https://assets.test/catalog.svg', async route => {
+        await held;
+        await route.fulfill({ contentType: 'image/svg+xml', body: '<svg xmlns="http://www.w3.org/2000/svg" width="40" height="40"/>' }).catch(() => {});
+    });
+    await page.evaluate(() => { window.pendingCatalog = BookJS.instance.render(); });
+    await page.waitForFunction(() => !!document.querySelector('.nop-measure-box img'));
+    assert.equal(await page.evaluate(() => BookJS.instance.isRendered), false);
+    assert.equal(await page.evaluate(() => window.status), '');
+    assert.equal(await page.evaluate(() => events.filter(event => event.name === 'book.after-complete').length), 0);
+    await page.evaluate(() => {
+        document.querySelector('#content-box h1').textContent = '新标题';
+        BookJS.instance.forceRender();
+    });
+    release();
+    await page.evaluate(() => pendingCatalog);
+    assert.deepEqual(await page.locator('.catalog-item-title').allTextContents(), ['新标题']);
+    assert.equal(await page.locator('.nop-page-item-catalog img').evaluate(img => img.naturalWidth), 40);
+    assert.equal(await page.evaluate(() => events.filter(event => event.name === 'book.after-complete').length), 1);
+    assert.equal(await page.locator('.nop-measure-box').count(), 0);
+    await assertFits(page);
+    assert.deepEqual(errors, []);
+});
+
+test('failed catalog resources and invalid callbacks reject without publishing a partial book', async t => {
+    const { page } = await fixture(t, '<h1>标题</h1><p>正文</p>', {
+        ...compactConfig, simpleCatalog: { header: '<img src="https://assets.test/missing.svg">' }
+    }, catalogCSS);
+    await assert.rejects(render(page), /Image failed/);
+    assert.equal(await page.locator('.nop-book').count(), 0);
+    await page.evaluate(() => { bookConfig.simpleCatalog = { makeItem: () => Promise.resolve('invalid') }; });
+    await assert.rejects(page.evaluate(() => BookJS.instance.forceRender()), /Catalog makeItem/);
+    assert.equal(await page.evaluate(() => window.status), '');
+    assert.equal(await page.evaluate(() => events.filter(event => event.name === 'book.after-complete').length), 0);
+    assert.equal(await page.locator('.nop-book').count(), 0);
 });

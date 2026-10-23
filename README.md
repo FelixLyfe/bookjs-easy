@@ -1,8 +1,8 @@
-# BookJS-Easy v2.2.0
+# BookJS-Easy v2.3.0
 
 ## 概述
 
-BookJS-Easy 是一个无需第三方运行时依赖的浏览器自动分页与打印预览工具，可通过浏览器打印生成 PDF。v2.2.0 增加集合与异步内容输入、元素底部预留空间、挂件应用范围，并统一页码范围中的数字字符串处理。
+BookJS-Easy 是一个无需第三方运行时依赖的浏览器自动分页与打印预览工具，可通过浏览器打印生成 PDF。v2.3.0 增加打印目录，修复盒子填充区内的强制换页，并补上跨页处的中文闭合标点避让。
 
 ## 主要特性
 
@@ -19,6 +19,7 @@ BookJS-Easy 是一个无需第三方运行时依赖的浏览器自动分页与�
   - 支持 `data-split-repeat` 属性让特定单元格在跨页后重复内容。
   - 单元格内的纯换行可以续接；独占一行的单个单元格仅包含内表时，可继续分页并重复内外表头。
 - **标题防孤悬**: 自动检测 H1-H6 标题后的内容，避免标题单独留在页尾。
+- **打印目录**: 按正文标题生成目录和跳转链接，长目录自动分页，正文连续编号保持稳定。
 - **页眉页脚系统**: 支持动态页码 (`${PAGE}`, `${TOTAL_PAGE}`) 和自定义 HTML 模板。
 - **调试模式**: 内置调试工具栏，支持快速跳转页面和打印预览。
 - **背景图片**: 支持页面级背景图片。
@@ -135,6 +136,8 @@ window.bookConfig = {
 
 `bottomOffset` 指定开始放置元素所需的页尾剩余空间，适用于 `block`、`text`、三种盒子及 `table`。数字使用 px，也可写 `"20mm"` 等尺寸；剩余空间不足时先换页，空页不会因此重复换页。
 
+`block-box` 和 `mix-box` 的填充区直接子节点支持 `data-op-type="new-page"` 或 `.nop-new-page`。换页后保留盒子外壳，连续标记及尾部标记不会额外生成空页；未设置 `.nop-fill-box` 时处理盒子自身的直接子节点。任意深度的嵌套指令和 `text-box` 内指令不在此范围。
+
 ```html
 <p data-op-type="text" data-op-param='{"bottomOffset":80}'>本段至少需要 80px 页尾空间才开始排版。</p>
 
@@ -150,6 +153,39 @@ window.bookConfig = {
 
 ### `window.bookConfig`
 全局配置对象，脚本加载时会自动读取。
+
+### `simpleCatalog` 打印目录
+
+默认关闭，设为 `true` 使用默认 H1–H6 标题及“目录”标题，也可传入配置：
+
+```javascript
+window.bookConfig = {
+  start: true,
+  simpleCatalog: {
+    titlesSelector: 'h1,h2,h3',
+    header: '<div class="catalog-title">报告目录</div>',
+    // showCatalog: false, // 临时关闭
+    // 可选：返回 HTML 字符串、DOM Element 或 false（跳过该项）。
+    makeItem(element, { title, level, pageNum, linkId }) {
+      const link = document.createElement('a');
+      link.href = '#' + linkId;
+      link.textContent = `${title} / ${pageNum}`;
+      link.style.paddingLeft = `${(level - 1) * 12}px`;
+      return link;
+    },
+  },
+};
+```
+
+目录插到正文之前，不继承正文挂件，也不参与简易页码编号。启用目录时，`simplePageNum.pageBegin/pageEnd` 仍按**正文页**取范围；目录中的数字与正文简易页码一致，只列入该范围内起始的标题。关闭简易页码时，目录使用从 1 开始的正文页号。普通挂件的 `${PAGE}/${TOTAL_PAGE}` 和完成事件仍使用包含目录的实际页号/总页数。
+
+跨页标题只列一次并保留完整标题；目录链接定位预览中的独立锚点，源 DOM 的 id 和内容保持不变。没有符合条件的标题、或所有项被过滤时，不插入空目录页。目录模板中的图片和字体也纳入资源等待、超时和取消处理。
+
+`makeItem` 接收原生 DOM 元素，必须同步返回，回调中不要修改正文布局。此版本支持 `titlesSelector`、`header`、`showCatalog`、`makeItem`；原版的侧栏、`positionSelector`、`getLevel/getItemInfo` 等插件接口尚未适配。标题层级按 H1–H6 确定，自定义选择器匹配的其他标签按一级处理。
+
+### `textNoBreakChars` 跨页标点规则
+
+默认避免以 `，。！？、；：）》】` 等闭合标点开始续页，也支持跨内联标签查找边界。可传入字符数组替换规则，或用 `textNoBreakChars: []` 关闭。规则同时用于文本和可拆分的表格单元格；极窄页面或连续标点无法避让时优先保证内容完整和分页能够继续。它不改动字符、字距或行内排版规则。
 
 ### `BookJS.start()`
 手动启动渲染，返回 Promise。适用于 `bookConfig.start = false` 的情况；没有实例时会创建实例。
@@ -248,6 +284,15 @@ npm run check
 npm test
 ```
 
-可用 `BOOKJS_CHROME` 指定浏览器可执行文件。44 个回归样例使用真实浏览器布局，覆盖文本及格式完整性、盒子、表格、异步输入与资源、挂件范围、纸张重排和失败/取消路径。
+可用 `BOOKJS_CHROME` 指定浏览器可执行文件。54 个回归样例使用真实浏览器布局，覆盖文本及格式完整性、盒子、表格、异步输入与资源、挂件范围、纸张重排、打印目录和失败/取消路径；包含目录 PDF 页数检查。
+
+另有可选的逆向版对照，复用原仓库的 5 组夹具，外部请求全部拦截。需要原仓库已有 `reverse-engineering/bookjs-eazy` 恢复产物；日常 `npm test` 不依赖它。
+
+```sh
+BOOKJS_LEGACY_ROOT=/path/to/bookjs-eazy npm run compare:legacy
+# 可选：BOOKJS_BASELINE=/path/to/old-bookjs-easy.js 同时加入旧版比较
+```
+
+结果写入 `test-results/legacy-comparison.json`，包含脚本 SHA-256 和各用例结果。对照检查内容守恒、页数、目录跳转和正文页码，不要求两版 DOM 完全一致。
 
 目前自动化回归已在 Chrome 中验证。
